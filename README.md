@@ -1,3 +1,4 @@
+<div align="center">
 # Crolendar
 <img width="400" height="404" alt="crolendar" src="https://github.com/user-attachments/assets/d2cc1874-5afe-4ca1-b087-018456f13bad" />
 
