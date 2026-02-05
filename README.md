@@ -23,10 +23,6 @@
 
 <br>
 
-<p align="center">
-  <img width="700" alt="main_demo" src="https://github.com/user-attachments/assets/d2cc1874-5afe-4ca1-b087-018456f13bad" />
-</p>
-
 <br>
 
 ## Why Crolendar?
@@ -78,4 +74,3 @@ Crolendar is built on a modern TUI stack:
 <p align="center">
 &copy; CodeFXR. All rights reserved.
 </p>
-```
