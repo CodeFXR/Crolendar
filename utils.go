@@ -9,18 +9,18 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// ansiEscapeRe matches 7-bit ESC and 8-bit C1 CSI/OSC sequences so untrusted
-// job labels cannot inject terminal control sequences.
-var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])|\x{009B}[0-9;?]*[ -/]*[@-~]|\x{009D}[^\x07\x1b\x{009C}]*(?:\x07|\x1b\\|\x{009C})`)
+// ansiEscapeRe matches 7-bit ESC and 8-bit C1 (CSI, OSC, DCS, SOS, PM, APC) sequences
+// so untrusted job labels cannot inject terminal control sequences.
+var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])|\x{009B}[0-9;?]*[ -/]*[@-~]|[\x{0090}\x{0098}\x{009D}\x{009E}\x{009F}][^\x07\x1b\x{009C}]*(?:\x07|\x1b\\|\x{009C})`)
 
 // isBlockedControlRune reports whether r is a control rune or unsafe format rune
-// (BiDi overrides/isolates, zero-width spaces, BOM), while preserving ZWJ (\u200D)
-// so joined emoji/grapheme clusters render cleanly.
+// (BiDi overrides/isolates, zero-width spaces, BOM), while preserving ZWNJ (\u200C)
+// and ZWJ (\u200D) so joined scripts and emoji clusters render cleanly.
 func isBlockedControlRune(r rune) bool {
 	if unicode.IsControl(r) || r == unicode.ReplacementChar {
 		return true
 	}
-	return unicode.Is(unicode.Cf, r) && r != '\u200D'
+	return unicode.Is(unicode.Cf, r) && r != '\u200C' && r != '\u200D'
 }
 
 // sanitizeText strips terminal escape sequences, control characters (Cc), and
@@ -120,7 +120,16 @@ func sameDay(a, b time.Time) bool {
 // addMonths shifts t by delta months, clamping the day of month to the target
 // month's last valid day (e.g. Jan 31 + 1 month -> Feb 28/29 instead of Mar 3).
 func addMonths(t time.Time, delta int) time.Time {
+	return addMonthsWithAnchor(t, delta, t.Day())
+}
+
+// addMonthsWithAnchor shifts t by delta months while honoring a preserved anchor
+// day of month (e.g. paging Jan 31 -> Feb 28 -> Mar 31 restores 31).
+func addMonthsWithAnchor(t time.Time, delta, anchorDay int) time.Time {
 	y, m, d := t.Date()
+	if anchorDay > 0 {
+		d = anchorDay
+	}
 	firstOfTarget := time.Date(y, m+time.Month(delta), 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 	lastDay := firstOfTarget.AddDate(0, 1, -1).Day()
 	if d > lastDay {
@@ -144,23 +153,24 @@ func wallHourTime(day time.Time, hour int) (time.Time, bool) {
 }
 
 // wallHourSpan returns the half-open UTC interval [start, end) covering all instants
-// whose local wall-clock hour on day equals hour (1 hour normally, 2 hours on DST fall-back,
-// and ok=false on a skipped spring-forward DST hour).
+// whose local wall-clock hour on day equals hour (handling 1h and 30m/15m DST shifts,
+// fall-back repeats, and returning ok=false on nonexistent spring-forward hours).
 func wallHourSpan(day time.Time, hour int) (start, end time.Time, ok bool) {
 	start, ok = wallHourTime(day, hour)
 	if !ok {
 		return time.Time{}, time.Time{}, false
 	}
+	const step = 15 * time.Minute
 	for {
-		prev := start.Add(-time.Hour)
+		prev := start.Add(-step)
 		if !sameDay(prev, start) || prev.Hour() != hour {
 			break
 		}
 		start = prev
 	}
-	end = start.Add(time.Hour)
+	end = start.Add(step)
 	for sameDay(end, start) && end.Hour() == hour {
-		end = end.Add(time.Hour)
+		end = end.Add(step)
 	}
 	return start, end, true
 }

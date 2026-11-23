@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -17,6 +18,7 @@ type model struct {
 	state              sessionState
 	width, height      int
 	cursor             time.Time
+	cursorAnchorDay    int
 	focusGrid          bool
 	viewport           viewport.Model
 	ready              bool
@@ -69,6 +71,51 @@ func (m model) findJobByKey(key JobKey) (JobItem, bool) {
 		}
 	}
 	return JobItem{}, false
+}
+
+func (m model) hasDuplicateKey(key JobKey) bool {
+	count := 0
+	for _, j := range m.jobs {
+		if j.HasStableKey() && j.Key() == key {
+			count++
+			if count > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *model) sanitizeLiveInput() {
+	raw := m.input.Value()
+	if raw == "" {
+		return
+	}
+	noEsc := ansiEscapeRe.ReplaceAllString(raw, "")
+	changed := noEsc != raw
+	var b strings.Builder
+	b.Grow(len(noEsc))
+	for _, r := range noEsc {
+		if isBlockedControlRune(r) {
+			changed = true
+			continue
+		}
+		b.WriteRune(r)
+	}
+	if !changed {
+		return
+	}
+	pos := m.input.Position()
+	clean := b.String()
+	diff := len([]rune(raw)) - len([]rune(clean))
+	m.input.Reset()
+	m.input.SetValue(clean)
+	if diff > 0 && pos > diff {
+		pos -= diff
+	} else if pos > len([]rune(clean)) {
+		pos = len([]rune(clean))
+	}
+	m.input.SetCursor(pos)
 }
 
 func (m model) Init() tea.Cmd {
@@ -219,6 +266,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "t":
 			if m.state != viewSettings {
 				m.cursor = time.Now()
+				m.cursorAnchorDay = 0
 				m = updateViewContent(m)
 				if m.state == viewWeek || m.state == viewDay {
 					m.scrollViewportToCurrentHour()
@@ -239,10 +287,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleGridKey(msg)
 
 	default:
-		// Forward non-key messages (such as cursor.BlinkMsg) to textinput when editing.
+		// Forward non-key messages (such as cursor.BlinkMsg or clipboard pasteMsg)
+		// to textinput when editing, scrubbing any unsafe escape/format runes from paste.
 		if m.state == viewSettings && m.settingsState != 0 {
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
+			m.sanitizeLiveInput()
 			return m, cmd
 		}
 	}
@@ -329,6 +379,7 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.sanitizeLiveInput()
 	m.settingsError = ""
 	return m, cmd
 }
@@ -374,6 +425,11 @@ func (m model) handleGridKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.settingsNotice = ""
 					return m, nil
 				}
+				if m.hasDuplicateKey(rawJob.Key()) {
+					m.settingsError = "Duplicate job key; cannot edit"
+					m.settingsNotice = ""
+					return m, nil
+				}
 				job := m.effectiveJob(rawJob)
 				m.settingsState = 1
 				m.settingsEditKey = rawJob.Key()
@@ -397,10 +453,12 @@ func (m model) handleGridKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		case "H", "[":
 			m.cursor = m.cursor.AddDate(0, 0, -7)
+			m.cursorAnchorDay = 0
 			m = updateViewContent(m)
 			return m, nil
 		case "L", "]":
 			m.cursor = m.cursor.AddDate(0, 0, 7)
+			m.cursorAnchorDay = 0
 			m = updateViewContent(m)
 			return m, nil
 		}
@@ -409,21 +467,31 @@ func (m model) handleGridKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "left", "h":
 		m.cursor = m.cursor.AddDate(0, 0, -1)
+		m.cursorAnchorDay = 0
 		m = updateViewContent(m)
 	case "right", "l":
 		m.cursor = m.cursor.AddDate(0, 0, 1)
+		m.cursorAnchorDay = 0
 		m = updateViewContent(m)
 	case "up", "k":
 		m.cursor = m.cursor.AddDate(0, 0, -7)
+		m.cursorAnchorDay = 0
 		m = updateViewContent(m)
 	case "down", "j":
 		m.cursor = m.cursor.AddDate(0, 0, 7)
+		m.cursorAnchorDay = 0
 		m = updateViewContent(m)
 	case "pgup":
-		m.cursor = addMonths(m.cursor, -1)
+		if m.cursorAnchorDay == 0 {
+			m.cursorAnchorDay = m.cursor.Day()
+		}
+		m.cursor = addMonthsWithAnchor(m.cursor, -1, m.cursorAnchorDay)
 		m = updateViewContent(m)
 	case "pgdown":
-		m.cursor = addMonths(m.cursor, 1)
+		if m.cursorAnchorDay == 0 {
+			m.cursorAnchorDay = m.cursor.Day()
+		}
+		m.cursor = addMonthsWithAnchor(m.cursor, 1, m.cursorAnchorDay)
 		m = updateViewContent(m)
 	}
 	return m, nil

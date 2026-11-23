@@ -442,3 +442,218 @@ func TestSettingsKeyCaptureBlankAliasNoIDAndResizeDuringEdit(t *testing.T) {
 		t.Fatalf("expected unrelated job untouched after mid-edit reorder, got %+v", eff0)
 	}
 }
+
+func TestTimeZoneDurationCapZWNJAndMonthAnchor(t *testing.T) {
+	// Preserve ZWNJ (U+200C) in non-Latin titles while blocking BiDi overrides.
+	persian := sanitizeText("نیم\u200Cفاصله\u202E")
+	if !strings.ContainsRune(persian, '\u200C') || strings.ContainsRune(persian, '\u202E') {
+		t.Fatalf("expected ZWNJ preserved and RLO stripped, got %q", persian)
+	}
+
+	// Job with TimeZone="UTC" running at 00:00 UTC must appear at 17:00 MST in Denver.
+	denver, err := time.LoadLocation("America/Denver")
+	if err != nil {
+		t.Skipf("America/Denver tzdata unavailable: %v", err)
+	}
+	utcJob := JobItem{
+		ID:          "utc-job",
+		Source:      "k8s",
+		Title:       "UTC Midnight",
+		TimeZone:    "UTC",
+		MatchesDay:  func(d time.Time) bool { return true },
+		MatchesHour: func(h time.Time) bool { return h.Hour() == 0 },
+	}
+	denverDay := time.Date(2026, 1, 15, 0, 0, 0, 0, denver) // MST = UTC-7
+	dayHours := indexDayHourJobs([]JobItem{utcJob}, denverDay)
+	if len(dayHours[17]) != 1 || len(dayHours[0]) != 0 {
+		t.Fatalf("expected UTC 00:00 job at 17:00 Denver, got h17=%d h0=%d", len(dayHours[17]), len(dayHours[0]))
+	}
+
+	// Job starting at 23:00 with Duration=3h must overlap 23:00 on day 0 plus 00:00 and 01:00 on day 1.
+	spanStart := time.Date(2026, 1, 15, 23, 0, 0, 0, time.UTC)
+	durJob := JobItem{
+		ID:       "long-job",
+		Source:   "systemd",
+		Title:    "Long Compaction",
+		Duration: 3 * time.Hour,
+		OccurrencesInRange: func(start, end time.Time) []time.Time {
+			if spanStart.Before(end) && spanStart.Add(3*time.Hour).After(start) {
+				return []time.Time{spanStart}
+			}
+			return nil
+		},
+	}
+	nextDayGrid := indexDayHourJobs([]JobItem{durJob}, time.Date(2026, 1, 16, 0, 0, 0, 0, time.UTC))
+	if len(nextDayGrid[0]) != 1 || len(nextDayGrid[1]) != 1 || len(nextDayGrid[2]) != 0 {
+		t.Fatalf("expected 3h job from 23:00 to cover 00:00 & 01:00 next day, got h0=%d h1=%d h2=%d",
+			len(nextDayGrid[0]), len(nextDayGrid[1]), len(nextDayGrid[2]))
+	}
+	if !durJob.OccursOnDay(time.Date(2026, 1, 16, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expected 3h job from Jan 15 23:00 to report OccursOnDay=true for Jan 16")
+	}
+
+	// Bounded occurrences cap must stop runaway generators without panicking.
+	floodJob := JobItem{
+		ID:     "flood",
+		Source: "test",
+		OccurrencesInRange: func(start, end time.Time) []time.Time {
+			out := make([]time.Time, maxOccurrencesPerQuery+500)
+			for i := range out {
+				out[i] = start
+			}
+			return out
+		},
+	}
+	if got := len(floodJob.boundedOccurrences(spanStart, spanStart.Add(24*time.Hour))); got != maxOccurrencesPerQuery {
+		t.Fatalf("expected boundedOccurrences cap %d, got %d", maxOccurrencesPerQuery, got)
+	}
+
+	// Month anchor preservation: Jan 31 -> PgDown (Feb 28) -> PgDown (Mar 31).
+	m := newModel(nil)
+	m.cursor = time.Date(2026, 1, 31, 10, 0, 0, 0, time.UTC)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = next.(model)
+	m = m.switchView(viewMonth, false)
+	m.focusGrid = true
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = next.(model)
+	if m.cursor.Month() != time.February || m.cursor.Day() != 28 {
+		t.Fatalf("expected Feb 28 after Jan 31 PgDown, got %v", m.cursor)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = next.(model)
+	if m.cursor.Month() != time.March || m.cursor.Day() != 31 {
+		t.Fatalf("expected Mar 31 restored from anchor after Feb 28 PgDown, got %v", m.cursor)
+	}
+}
+
+func TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates(t *testing.T) {
+	// 1. 8-bit C1 DCS/SOS/PM/APC sequences must be stripped with their payloads.
+	c1Dirty := "\u0090secret-dcs\u009C\u0098secret-sos\u009C\u009Epm\u009C\u009Fapc\u009Cok"
+	if got := sanitizeText(c1Dirty); got != "ok" {
+		t.Fatalf("expected 8-bit C1 string sequences stripped, got %q", got)
+	}
+
+	// 2. Dense 15-min schedule across 42-day grid (4032 > 2048 occurrences) must not drop day 41.
+	start42 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	denseJob := JobItem{
+		ID:     "dense-15m",
+		Source: "cron",
+		OccurrencesInRange: func(start, end time.Time) []time.Time {
+			var out []time.Time
+			for ts := start; ts.Before(end); ts = ts.Add(15 * time.Minute) {
+				out = append(out, ts)
+			}
+			return out
+		},
+	}
+	dayGrid42 := indexDayJobs([]JobItem{denseJob}, start42, 42)
+	if len(dayGrid42[41]) != 1 {
+		t.Fatalf("expected dense 15m job still present on day 42, got %d", len(dayGrid42[41]))
+	}
+
+	// 3. Multi-week Duration (10 days) must still show on day 10.
+	longStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tenDayJob := JobItem{
+		ID:       "ten-day",
+		Source:   "ops",
+		Duration: 10 * 24 * time.Hour,
+		OccurrencesInRange: func(start, end time.Time) []time.Time {
+			if longStart.Before(end) && longStart.Add(10*24*time.Hour).After(start) {
+				return []time.Time{longStart}
+			}
+			return nil
+		},
+	}
+	if !tenDayJob.OccursOnDay(time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expected 10-day Duration job starting Jan 1 to occur on Jan 10")
+	}
+
+	// 4. Combined MatchesDay + MatchesHour must filter Week/Day by MatchesDay too.
+	comboJob := JobItem{
+		ID:          "combo",
+		Source:      "cron",
+		MatchesDay:  func(d time.Time) bool { return d.Weekday() == time.Monday },
+		MatchesHour: func(h time.Time) bool { return h.Hour() == 9 },
+	}
+	weekSun := time.Date(2026, 1, 11, 0, 0, 0, 0, time.UTC) // Sunday
+	wCombo := indexWeekJobs([]JobItem{comboJob}, weekSun)
+	if len(wCombo[0][9]) != 0 || len(wCombo[1][9]) != 1 {
+		t.Fatalf("combined MatchesDay+MatchesHour mismatch in week grid: sun=%d mon=%d", len(wCombo[0][9]), len(wCombo[1][9]))
+	}
+	if comboJob.OccursInHour(time.Date(2026, 1, 11, 9, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expected combined job to return false on Sunday 09:00")
+	}
+
+	// 5. Denver fall-back 01:00 second-fold 2h Duration propagation on MatchesHour.
+	denver, err := time.LoadLocation("America/Denver")
+	if err == nil {
+		secondFoldOnly := JobItem{
+			ID:          "fold2-2h",
+			Source:      "cron",
+			Duration:    2 * time.Hour,
+			MatchesHour: func(h time.Time) bool { name, _ := h.Zone(); return h.Hour() == 1 && name == "MST" },
+		}
+		fallDay := time.Date(2026, 11, 1, 0, 0, 0, 0, denver)
+		fHours := indexDayHourJobs([]JobItem{secondFoldOnly}, fallDay)
+		if len(fHours[1]) != 1 || len(fHours[2]) != 1 || len(fHours[3]) != 0 {
+			t.Fatalf("expected second-fold 2h MatchesHour job at 01:00 and 02:00 only, got h1=%d h2=%d h3=%d", len(fHours[1]), len(fHours[2]), len(fHours[3]))
+		}
+		// Invalid nonblank TimeZone must fall back to caller fallback, not time.Local.
+		badTZJob := JobItem{TimeZone: "Invalid/Zone"}
+		if badTZJob.effectiveLocation(denver) != denver {
+			t.Fatalf("expected invalid TimeZone to fall back to caller fallback %v, got %v", denver, badTZJob.effectiveLocation(denver))
+		}
+	}
+
+	// 6. Half-hour DST (Australia/Lord_Howe): fall-back hour 1 must stop before 02:00.
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err == nil {
+		lhFall := time.Date(2026, 4, 5, 12, 0, 0, 0, lordHowe)
+		s1, e1, ok1 := wallHourSpan(lhFall, 1)
+		s2, _, ok2 := wallHourSpan(lhFall, 2)
+		if !ok1 || !ok2 || !e1.Equal(s2) || e1.Sub(s1) != 90*time.Minute {
+			t.Fatalf("unexpected Lord_Howe fall-back hour 1 span: [%v..%v) vs h2=%v", s1, e1, s2)
+		}
+	}
+
+	// 7. Multi-TZ MatchesDay overlap (Denver Jan 15 overlaps Jan 15 and Jan 16 in Kiritimati).
+	if err == nil {
+		kiriti, kerr := time.LoadLocation("Pacific/Kiritimati")
+		if kerr == nil {
+			kiritiJob := JobItem{
+				ID:         "kiriti-jan15",
+				TimeZone:   "Pacific/Kiritimati",
+				MatchesDay: func(d time.Time) bool { return d.Day() == 15 },
+			}
+			if !kiritiJob.OccursOnDay(time.Date(2026, 1, 15, 0, 0, 0, 0, denver)) {
+				t.Fatalf("expected Pacific/Kiritimati Jan 15 job to overlap Denver Jan 15")
+			}
+			_ = kiriti
+		}
+	}
+
+	// 8. Duplicate (Source, ID) must be rejected before Settings edit, and sanitizeLiveInput scrubs BiDi.
+	mDup := newModel([]JobItem{
+		{ID: "same", Source: "cron", Title: "First"},
+		{ID: "same", Source: "cron", Title: "Second"},
+		{ID: "unique", Source: "cron", Title: "Third"},
+	})
+	next, _ := mDup.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	mDup = next.(model)
+	mDup = mDup.switchView(viewSettings, false)
+	mDup.focusGrid = true
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	if mDup.settingsState != 0 || mDup.settingsError == "" {
+		t.Fatalf("expected duplicate key edit blocked, got state=%d err=%q", mDup.settingsState, mDup.settingsError)
+	}
+	mDup.settingsCursor = 2
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	mDup.input.SetValue("bad\u202E\u200Balias")
+	mDup.sanitizeLiveInput()
+	if mDup.input.Value() != "badalias" {
+		t.Fatalf("expected sanitizeLiveInput to scrub Cf runes leaving badalias, got %q", mDup.input.Value())
+	}
+}

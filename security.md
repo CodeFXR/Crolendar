@@ -113,6 +113,27 @@ This document records all security vulnerabilities and functional/layout bugs id
 - **Patch:** Updated `ansiEscapeRe` to strip 8-bit C1 CSI/OSC sequences and updated `isBlockedControlRune` to strip unsafe `Cf` runes (BiDi overrides/isolates, ZWSP, BOM) while preserving `U+200D` (ZWJ).
 - **Regression Tests:** `TestSanitizeTextStripsEscapesControlsAndUnicodeSpoofing`, `TestTruncateWidthMatchesLipglossAcrossGraphemes` (`ui_test.go`).
 
+### SEC-12: Job TimeZone/Duration Enforcement, Occurrence Caps, Day Indexing & ZWNJ Preservation (Round 3)
+- **Severity:** Medium
+- **Affected Files:** `types.go`, `ui_day.go`, `utils.go`, `main.go`
+- **Root Cause:**
+  1. `JobItem.TimeZone` (`Location()`) and `JobItem.Duration` were defined on the model but ignored by day/hour evaluation (`OccursOnDay`, `OccursInHour`, `indexWeekJobs`), causing non-local legacy matchers and multi-hour/cross-midnight jobs to misalign.
+  2. `OccurrencesInRange` outputs had no upper bound, and `ui_day.go` still performed 24 linear `JobsForHour` scans per render.
+  3. `isBlockedControlRune` stripped ZWNJ (`U+200C`), breaking Persian/Arabic/Indic ligatures, and paging `Jan 31 -> Feb 28 -> Mar` lost the 31st day anchor.
+- **Patch:** Unified hour-grid indexing (`indexHourGrid`, `indexDayHourJobs`, `indexWeekJobs`), applied `effectiveLocation` and `clampedDuration` overlap intervals, bounded runaway range results (`maxOccurrencesPerQuery`), switched `ui_day.go` to `indexDayHourJobs`, preserved `U+200C` alongside `U+200D`, and added `cursorAnchorDay` via `addMonthsWithAnchor`.
+- **Regression Tests:** `TestTimeZoneDurationCapZWNJAndMonthAnchor` (`ui_test.go`).
+
+### SEC-13: Dense Range Truncation, 30m DST Spans, Combined Matchers, Clipboard Paste & Duplicate Keys (Round 3 Audit Fixes)
+- **Severity:** High / Medium
+- **Affected Files:** `types.go`, `utils.go`, `main.go`
+- **Root Cause:**
+  1. Capping `boundedOccurrences` at `2048` silently truncated dense 15-minute schedules over a 42-day grid; a 7-day duration cap truncated longer events.
+  2. `wallHourSpan` stepped by 1 hour (breaking 30m DST transitions like `Australia/Lord_Howe`); `indexHourGrid` broke after the first fold of a multi-hour `MatchesHour` job, and ignored `MatchesDay` when combined with `MatchesHour`.
+  3. Invalid non-blank `TimeZone` values ignored caller fallback in `effectiveLocation`; single-noon conversion missed wide-offset day overlaps (e.g., Denver vs Kiritimati).
+  4. `bubbles/textinput` clipboard `pasteMsg` bypassed `tea.KeyRunes` filtering, `ansiEscapeRe` omitted 8-bit C1 DCS/SOS/PM/APC string sequences, and duplicate `(Source, ID)` jobs were editable in Settings.
+- **Patch:** Raised `maxOccurrencesPerQuery` (`100000`) and `maxDurationLookback` (`366d`), switched `wallHourSpan` to 15-minute steps, evaluated both `MatchesDay` and all fall-back folds consistently, added multi-TZ interval overlap via `matchesViewerDay`, preserved fallback timezone on load error, added `sanitizeLiveInput()`, extended `ansiEscapeRe` to C1 DCS/SOS/PM/APC, and blocked editing duplicate `(Source, ID)` keys.
+- **Regression Tests:** `TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates` (`ui_test.go`).
+
 ---
 
 ## 3. Verification Gate

@@ -43,6 +43,8 @@ func renderDayView(m model, availWidth int) (string, string) {
 
 	header := lipgloss.JoinHorizontal(lipgloss.Top, timeHeader, gridHeader)
 
+	hourGrid := indexDayHourJobs(m.jobs, m.cursor)
+
 	var hours []string
 	var bars []string
 
@@ -66,10 +68,8 @@ func renderDayView(m model, availWidth int) (string, string) {
 			BorderForeground(borderGray)
 
 		var jobs []JobItem
-		if checkTime, ok := wallHourTime(m.cursor, h); ok {
-			for _, j := range JobsForHour(m.jobs, checkTime) {
-				jobs = append(jobs, m.effectiveJob(j))
-			}
+		for _, j := range hourGrid[h] {
+			jobs = append(jobs, m.effectiveJob(j))
 		}
 
 		line1, line2 := formatHourSlotLines(jobs, barWidth, true)
