@@ -1,0 +1,4 @@
+# Compiled binary and test coverage artifacts
+/crolendar
+*.out
+*.test

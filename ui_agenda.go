@@ -4,129 +4,218 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
 	"github.com/charmbracelet/lipgloss"
 )
 
-func renderAgendaView(m model) string {
-	availWidth := m.width - 22
-	availHeight := m.height - 1
-	halfHeight := availHeight / 2
-
-	first := time.Date(m.cursor.Year(), m.cursor.Month(), 1, 0, 0, 0, 0, time.Local)
-	startSpace := int(first.Weekday())
-	startDate := first.AddDate(0, 0, -startSpace)
+func renderAgendaView(m model, availWidth, bodyHeight int) string {
+	now := time.Now()
+	loc := m.cursor.Location()
+	if loc == nil {
+		loc = time.Local
+	}
+	first := time.Date(m.cursor.Year(), m.cursor.Month(), 1, 0, 0, 0, 0, loc)
+	startDate := first.AddDate(0, 0, -int(first.Weekday()))
+	dayGrid := indexDayJobs(m.jobs, startDate, 42)
 
 	cellWidth := availWidth / 7
-	headerStyle := lipgloss.NewStyle().Width(cellWidth).Align(lipgloss.Center).Foreground(purple).Bold(true)
+	if cellWidth < 3 {
+		cellWidth = 3
+	}
+
+	compactGrid := bodyHeight < 24
+	showDotsRow := bodyHeight >= 20
+
+	titlePaddingTop := 1
+	titlePaddingBottom := 1
+	if compactGrid {
+		titlePaddingTop = 0
+		titlePaddingBottom = 0
+	}
+
+	title := viewTitleStyle.
+		Width(availWidth).
+		PaddingTop(titlePaddingTop).
+		PaddingBottom(titlePaddingBottom).
+		Render(m.cursor.Format("January 2006"))
+
+	headerStyle := lipgloss.NewStyle().
+		Width(cellWidth).
+		Align(lipgloss.Center).
+		Foreground(purple).
+		Bold(true)
 	days := []string{"S", "M", "T", "W", "T", "F", "S"}
-	var headerRow []string
-	for _, d := range days { headerRow = append(headerRow, headerStyle.Render(d)) }
-	
-	// Add padding to the header to separate it from the numbers
+	headerRow := make([]string, 0, 7)
+	for _, d := range days {
+		headerRow = append(headerRow, headerStyle.Render(d))
+	}
+	gridHeaderPad := 1
+	if compactGrid {
+		gridHeaderPad = 0
+	}
 	gridHeader := lipgloss.NewStyle().
-		PaddingBottom(1).
+		PaddingBottom(gridHeaderPad).
 		Render(lipgloss.JoinHorizontal(lipgloss.Top, headerRow...))
 
 	var rows []string
 	var currentRow []string
-	today := time.Now().Format("2006-01-02")
+	var selectedJobs []JobItem
+	foundSelected := false
 	for i := 0; i < 42; i++ {
 		curr := startDate.AddDate(0, 0, i)
 		style := lipgloss.NewStyle().Width(cellWidth).Align(lipgloss.Center)
-		
-		// Month coloring
-		if curr.Month() != m.cursor.Month() { 
-			style = style.Foreground(gray) 
-		} else { 
-			style = style.Foreground(white) 
-		}
 
-		// Current Day Highlight (Bold Purple)
-		if curr.Format("2006-01-02") == today {
+		if curr.Month() != m.cursor.Month() {
+			style = style.Foreground(mutedGray)
+		} else {
+			style = style.Foreground(softWhite)
+		}
+		if sameDay(curr, now) {
 			style = style.Foreground(purple).Bold(true)
 		}
-
-		// Selection Highlight (Blue Background)
-		if curr.Format("2006-01-02") == m.cursor.Format("2006-01-02") { 
-			style = style.Background(blue).Foreground(white).Bold(true) 
+		if sameDay(curr, m.cursor) {
+			style = style.Background(blue).Foreground(white).Bold(true)
 		}
 
-		dayStr := fmt.Sprintf("%d", curr.Day())
-		content := style.Render(dayStr)
+		dayJobs := dayGrid[i]
+		if sameDay(curr, m.cursor) {
+			selectedJobs = dayJobs
+			foundSelected = true
+		}
+		dayStr := fmt.Sprintf("%2d", curr.Day())
+		if !showDotsRow && len(dayJobs) > 0 {
+			dayStr = fmt.Sprintf("%2d*", curr.Day())
+		}
+		cell := style.Render(dayStr)
 
-		// Check for jobs
-		dayJobs := GetJobsForDay(m.jobs, curr)
-		if len(dayJobs) > 0 {
-			// Get color of first job for the dot
-			_, colorHex := m.config.GetJobDisplay(dayJobs[0].Command)
-			
-			// Use the same width and alignment as the day number to ensure perfect centering
-			dotStyle := lipgloss.NewStyle().
+		if showDotsRow {
+			dotLine := " "
+			dotColor := mutedGray
+			if len(dayJobs) > 0 {
+				firstJob := m.effectiveJob(dayJobs[0])
+				dotColor = firstJob.LipglossColor()
+				dots := len(dayJobs)
+				if dots > 3 {
+					dots = 3
+				}
+				dotLine = strings.Repeat("•", dots)
+			}
+			dot := lipgloss.NewStyle().
 				Width(cellWidth).
 				Align(lipgloss.Center).
-				Foreground(lipgloss.Color(colorHex))
-				
-			dot := dotStyle.Render("•")
-			
-			content = lipgloss.JoinVertical(lipgloss.Center, style.Render(dayStr), dot)
-		} else {
-			// Add a blank line of same height/style to maintain grid consistency
-			blank := lipgloss.NewStyle().Width(cellWidth).Align(lipgloss.Center).Render(" ")
-			content = lipgloss.JoinVertical(lipgloss.Center, style.Render(dayStr), blank)
+				Foreground(dotColor).
+				Render(dotLine)
+			cell = lipgloss.JoinVertical(lipgloss.Center, cell, dot)
 		}
 
-		currentRow = append(currentRow, content)
-				if len(currentRow) == 7 {
-					rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, currentRow...))
-					currentRow = []string{}
-				}	}
+		currentRow = append(currentRow, cell)
+		if len(currentRow) == 7 {
+			rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, currentRow...))
+			currentRow = nil
+		}
+	}
 
-	title := lipgloss.NewStyle().
+	topContent := lipgloss.JoinVertical(
+		lipgloss.Center,
+		title,
+		gridHeader,
+		lipgloss.JoinVertical(lipgloss.Left, rows...),
+	)
+	topLines := lipgloss.Height(topContent)
+
+	divWidth := availWidth - 4
+	if divWidth < 1 {
+		divWidth = 1
+	}
+	divider := lipgloss.NewStyle().
+		Width(availWidth).
+		Align(lipgloss.Center).
+		Foreground(borderGray).
+		Render(strings.Repeat("─", divWidth))
+
+	bottomHeight := bodyHeight - topLines - 1
+	if bottomHeight < 1 {
+		bottomHeight = 1
+	}
+
+	if !foundSelected {
+		selectedJobs = JobsForDay(m.jobs, m.cursor)
+	}
+	dayHeading := fmt.Sprintf("%s  (%s)", m.cursor.Format("Monday, Jan 02"), formatDayCountLabel(len(selectedJobs)))
+	dayHeader := lipgloss.NewStyle().
 		Width(availWidth).
 		Align(lipgloss.Center).
 		Foreground(blue).
 		Bold(true).
-		PaddingTop(2).
-		PaddingBottom(1).
-		Render(m.cursor.Format("January 2006"))
+		Render(truncateWidth(dayHeading, availWidth-2))
 
-	topContent := lipgloss.JoinVertical(lipgloss.Center,
-		title,
-		gridHeader, 
-		lipgloss.JoinVertical(lipgloss.Left, rows...))
-
-	topHalf := lipgloss.NewStyle().
-		Width(availWidth).
-		Height(halfHeight).
-		Align(lipgloss.Center, lipgloss.Top). 
-		Render(topContent)
-
-	line := lipgloss.NewStyle().Foreground(gray).Render(strings.Repeat("─", availWidth-2))
-	
-	// Bottom Half: Show Jobs for Selected Day
-	selectedJobs := GetJobsForDay(m.jobs, m.cursor)
-	var jobList string
-	if len(selectedJobs) > 0 {
-		var lines []string
-		for _, j := range selectedJobs {
-			label, colorHex := m.config.GetJobDisplay(j.Command)
-			style := lipgloss.NewStyle().Foreground(lipgloss.Color(colorHex))
-			lines = append(lines, style.Render(fmt.Sprintf("• %s", label)))
-		}
-		jobList = lipgloss.JoinVertical(lipgloss.Left, lines...)
-	} else {
-		jobList = lipgloss.NewStyle().Foreground(gray).Render("No Scheduled Events")
+	maxEventLines := bottomHeight - 2
+	if maxEventLines < 1 {
+		maxEventLines = 1
 	}
 
-	bottomContent := lipgloss.JoinVertical(lipgloss.Center, 
-		"\n", 
-		lipgloss.NewStyle().Foreground(blue).Bold(true).Render(m.cursor.Format("Monday 02")), 
-		"\n\n", 
-		jobList,
-	)
+	var jobBlock string
+	if len(selectedJobs) == 0 {
+		jobBlock = mutedTextStyle.Render("No scheduled events")
+	} else {
+		var lines []string
+		limit := len(selectedJobs)
+		overflow := 0
+		inlineSuffix := ""
+		if limit > maxEventLines {
+			if maxEventLines > 1 {
+				limit = maxEventLines - 1
+				overflow = len(selectedJobs) - limit
+			} else {
+				limit = 1
+				inlineSuffix = fmt.Sprintf(" (+%d more)", len(selectedJobs)-1)
+			}
+		}
+		maxLineWidth := availWidth - 4
+		if maxLineWidth < 8 {
+			maxLineWidth = 8
+		}
+		for i := 0; i < limit; i++ {
+			j := m.effectiveJob(selectedJobs[i])
+			swatch := lipgloss.NewStyle().Foreground(j.LipglossColor()).Render("■")
+			meta := j.DisplaySchedule()
+			if src := j.DisplaySource(); src != "" {
+				meta = fmt.Sprintf("[%s] %s", src, meta)
+			}
+			availText := maxLineWidth - 2
+			if inlineSuffix != "" {
+				suffix := inlineSuffix
+				if len(suffix) >= availText-2 {
+					suffix = fmt.Sprintf(" (+%d)", len(selectedJobs)-1)
+				}
+				if availText > len(suffix)+2 {
+					text := truncateWidth(fmt.Sprintf("%s  %s", j.DisplayName(), meta), availText-len(suffix)) + suffix
+					lines = append(lines, swatch+" "+lipgloss.NewStyle().Foreground(softWhite).Render(text))
+				} else {
+					lines = append(lines, swatch+" "+lipgloss.NewStyle().Foreground(softWhite).Render(truncateWidth(strings.TrimSpace(suffix), availText)))
+				}
+			} else {
+				text := truncateWidth(fmt.Sprintf("%s  %s", j.DisplayName(), meta), availText)
+				lines = append(lines, swatch+" "+lipgloss.NewStyle().Foreground(softWhite).Render(text))
+			}
+		}
+		if overflow > 0 {
+			lines = append(lines, mutedTextStyle.Render(truncateWidth(fmt.Sprintf("+%d more", overflow), maxLineWidth)))
+		}
+		jobBlock = lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
 
-	bottomHalf := lipgloss.NewStyle().Width(availWidth).Height(halfHeight).Align(lipgloss.Center, lipgloss.Top).
-	Render(bottomContent)
+	bottomContent := lipgloss.JoinVertical(lipgloss.Center, dayHeader, "", jobBlock)
+	bottomPanel := lipgloss.NewStyle().
+		Width(availWidth).
+		Height(bottomHeight).
+		MaxHeight(bottomHeight).
+		Align(lipgloss.Center, lipgloss.Top).
+		Render(bottomContent)
 
-	return lipgloss.JoinVertical(lipgloss.Left, topHalf, line, bottomHalf)
+	return lipgloss.NewStyle().
+		Width(availWidth).
+		Height(bodyHeight).
+		MaxHeight(bodyHeight).
+		Render(lipgloss.JoinVertical(lipgloss.Left, topContent, divider, bottomPanel))
 }
