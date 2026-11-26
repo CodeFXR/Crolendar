@@ -9,14 +9,13 @@ import (
 )
 
 const (
-	sidebarWidth              = 20
-	sidebarFullWidth          = sidebarWidth + 1 // sidebar + 1-col right border
-	minTermWidth              = 44
-	minTermHeight             = 14
-	defaultJobColor           = "#0052D4"
-	maxOccurrencesPerQuery    = 100000
-	maxDurationLookback       = 366 * 24 * time.Hour
-	maxLegacyDurationLookback = 31 * 24 * time.Hour
+	sidebarWidth           = 20
+	sidebarFullWidth       = sidebarWidth + 1 // sidebar + 1-col right border
+	minTermWidth           = 44
+	minTermHeight          = 14
+	defaultJobColor        = "#0052D4"
+	maxOccurrencesPerQuery = 100000
+	maxDurationLookback    = 31 * 24 * time.Hour
 )
 
 type sessionState int
@@ -61,12 +60,15 @@ type JobOverride struct {
 
 // JobProvider defines the contract for future read-only job source adapters
 // (cron, systemd timers, Kubernetes CronJobs, etc.).
+// Implementations should respect ctx cancellation, assign Name() to each JobItem.Source,
+// and emit unique non-empty JobItem.ID values within that source.
 type JobProvider interface {
 	Name() string
 	Load(ctx context.Context) ([]JobItem, error)
 }
 
 // JobItem is a provider-agnostic representation of a scheduled task for UI rendering.
+// Duration > 0 extends each occurrence across all overlapped hour/day cells up to maxDurationLookback.
 type JobItem struct {
 	ID            string
 	Title         string
@@ -77,7 +79,8 @@ type JobItem struct {
 	ScheduleLabel string
 	Color         string
 
-	// Optional range occurrence provider (preferred for future adapters).
+	// OccurrencesInRange (preferred for Phase 2 adapters) accepts an arbitrary timezone
+	// half-open interval [start, end) and returns chronological occurrences in [start, end).
 	OccurrencesInRange func(start, end time.Time) []time.Time
 	// Legacy/simple predicate matchers when OccurrencesInRange is nil.
 	MatchesDay  func(day time.Time) bool
@@ -166,19 +169,19 @@ func (j JobItem) effectiveLocation(fallback *time.Location) *time.Location {
 	return time.Local
 }
 
-// matchesViewerDay checks whether j.MatchesDay matches any calendar date in jobLoc
-// overlapping the viewer interval [dayStart, dayEnd).
+// matchesViewerDay maps a day-only job deterministically to the single viewer calendar day
+// containing the start (00:00 in jobLoc) of that job-local date, avoiding double placement.
 func (j JobItem) matchesViewerDay(dayStart, dayEnd time.Time, jobLoc *time.Location) bool {
 	if j.MatchesDay == nil {
 		return true
 	}
 	d0 := dayStart.In(jobLoc)
-	if j.MatchesDay(d0) {
-		return true
-	}
-	d1 := dayEnd.Add(-time.Nanosecond).In(jobLoc)
-	if !sameDay(d0, d1) && j.MatchesDay(d1) {
-		return true
+	base := time.Date(d0.Year(), d0.Month(), d0.Day(), 0, 0, 0, 0, jobLoc)
+	for offset := 0; offset <= 2; offset++ {
+		jobMidnight := base.AddDate(0, 0, offset)
+		if !jobMidnight.Before(dayStart) && jobMidnight.Before(dayEnd) && j.MatchesDay(jobMidnight) {
+			return true
+		}
 	}
 	return false
 }
@@ -375,8 +378,160 @@ type hourSpan struct {
 	ok    bool
 }
 
-// indexHourGrid pre-computes a [numDays][24] hour grid over [startDay, startDay+numDays)
-// handling DST gaps/folds, TimeZone conversion, Duration overlap, and capped range results.
+func buildHourSpans(start time.Time, numDays int) ([]time.Time, [][24]hourSpan) {
+	dayDates := make([]time.Time, numDays)
+	spans := make([][24]hourSpan, numDays)
+	for d := 0; d < numDays; d++ {
+		dayDates[d] = start.AddDate(0, 0, d)
+		for h := 0; h < 24; h++ {
+			s, e, ok := wallHourSpan(dayDates[d], h)
+			spans[d][h] = hourSpan{start: s, end: e, ok: ok}
+		}
+	}
+	return dayDates, spans
+}
+
+// markSpanOverlap records job across only the hour cells actually overlapped by [occ, occ+dur),
+// avoiding an O(numDays * 24) scan per occurrence.
+func markSpanOverlap(
+	grid [][24][]JobItem,
+	seen [][24]bool,
+	dayDates []time.Time,
+	spans [][24]hourSpan,
+	numDays int,
+	loc *time.Location,
+	occ time.Time,
+	dur time.Duration,
+	job JobItem,
+) {
+	occEnd := occ.Add(dur)
+	dStart := 0
+	if !occ.Before(dayDates[0]) {
+		localOcc := occ.In(loc)
+		found := false
+		for d := 0; d < numDays; d++ {
+			if sameDay(localOcc, dayDates[d]) {
+				dStart = d
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+	}
+	for d := dStart; d < numDays; d++ {
+		for h := 0; h < 24; h++ {
+			sp := spans[d][h]
+			if !sp.ok {
+				continue
+			}
+			if !sp.start.Before(occEnd) {
+				return
+			}
+			if !seen[d][h] && occurrenceOverlaps(occ, dur, sp.start, sp.end) {
+				seen[d][h] = true
+				grid[d][h] = append(grid[d][h], job)
+			}
+		}
+	}
+}
+
+func indexRangeJobHours(
+	grid [][24][]JobItem,
+	seen [][24]bool,
+	dayDates []time.Time,
+	spans [][24]hourSpan,
+	start, end time.Time,
+	numDays int,
+	loc *time.Location,
+	job JobItem,
+) {
+	dur := job.clampedDuration()
+	for _, occ := range job.boundedOccurrences(start, end) {
+		if !occurrenceOverlaps(occ, dur, start, end) {
+			continue
+		}
+		if dur <= 0 {
+			localOcc := occ.In(loc)
+			hIdx := localOcc.Hour()
+			for d := 0; d < numDays; d++ {
+				if sameDay(localOcc, dayDates[d]) && hIdx >= 0 && hIdx < 24 && !seen[d][hIdx] {
+					seen[d][hIdx] = true
+					grid[d][hIdx] = append(grid[d][hIdx], job)
+					break
+				}
+			}
+			continue
+		}
+		markSpanOverlap(grid, seen, dayDates, spans, numDays, loc, occ, dur, job)
+	}
+}
+
+func indexLegacyJobHours(
+	grid [][24][]JobItem,
+	seen [][24]bool,
+	dayDates []time.Time,
+	spans [][24]hourSpan,
+	start time.Time,
+	numDays int,
+	loc *time.Location,
+	job JobItem,
+) {
+	jobLoc := job.effectiveLocation(loc)
+	if job.MatchesHour == nil {
+		if job.MatchesDay != nil {
+			for d := 0; d < numDays; d++ {
+				if job.matchesViewerDay(dayDates[d], start.AddDate(0, 0, d+1), jobLoc) {
+					grid[d][0] = append(grid[d][0], job)
+				}
+			}
+		}
+		return
+	}
+
+	dur := job.clampedDuration()
+	lookbackDays := 0
+	if dur > time.Hour {
+		lookbackDays = int((dur + 23*time.Hour) / (24 * time.Hour))
+	}
+	for d := -lookbackDays; d < numDays; d++ {
+		dayDate := start.AddDate(0, 0, d)
+		for h := 0; h < 24; h++ {
+			var sp hourSpan
+			if d >= 0 {
+				sp = spans[d][h]
+			} else {
+				s, e, ok := wallHourSpan(dayDate, h)
+				sp = hourSpan{start: s, end: e, ok: ok}
+			}
+			if !sp.ok {
+				continue
+			}
+			for slot := sp.start; slot.Before(sp.end); slot = slot.Add(time.Hour) {
+				jobSlot := slot.In(jobLoc)
+				if !job.MatchesHour(jobSlot) || (job.MatchesDay != nil && !job.MatchesDay(jobSlot)) {
+					continue
+				}
+				if dur <= time.Hour {
+					if d >= 0 && !seen[d][h] {
+						seen[d][h] = true
+						grid[d][h] = append(grid[d][h], job)
+					}
+					break
+				}
+				markSpanOverlap(grid, seen, dayDates, spans, numDays, loc, slot, dur, job)
+			}
+		}
+	}
+}
+
+// indexHourGrid pre-computes a [numDays][24] hour grid over [startDay, startDay+numDays).
+//
+// Invariants:
+//  1. Bucketing & Display: All grid columns and hourly slots are indexed in the viewer's location.
+//  2. Matcher Evaluation: Legacy MatchesHour/MatchesDay predicates evaluate instants converted to job.Location().
+//  3. Range & Duration: OccurrencesInRange runs once per job across [start-clampedDuration, end) capped at maxOccurrencesPerQuery.
 func indexHourGrid(jobs []JobItem, startDay time.Time, numDays int) [][24][]JobItem {
 	if numDays <= 0 {
 		return nil
@@ -391,116 +546,17 @@ func indexHourGrid(jobs []JobItem, startDay time.Time, numDays int) [][24][]JobI
 	}
 	start := time.Date(startDay.Year(), startDay.Month(), startDay.Day(), 0, 0, 0, 0, loc)
 	end := start.AddDate(0, 0, numDays)
-	dayDates := make([]time.Time, numDays)
-	spans := make([][24]hourSpan, numDays)
-	for d := 0; d < numDays; d++ {
-		dayDates[d] = start.AddDate(0, 0, d)
-		for h := 0; h < 24; h++ {
-			s, e, ok := wallHourSpan(dayDates[d], h)
-			spans[d][h] = hourSpan{start: s, end: e, ok: ok}
-		}
-	}
+	dayDates, spans := buildHourSpans(start, numDays)
 
 	for _, job := range jobs {
 		seen := make([][24]bool, numDays)
-		dur := job.clampedDuration()
 		if job.OccurrencesInRange != nil {
-			for _, occ := range job.boundedOccurrences(start, end) {
-				if !occurrenceOverlaps(occ, dur, start, end) {
-					continue
-				}
-				if dur <= 0 {
-					localOcc := occ.In(loc)
-					hIdx := localOcc.Hour()
-					for d := 0; d < numDays; d++ {
-						if sameDay(localOcc, dayDates[d]) && hIdx >= 0 && hIdx < 24 && !seen[d][hIdx] {
-							seen[d][hIdx] = true
-							grid[d][hIdx] = append(grid[d][hIdx], job)
-							break
-						}
-					}
-					continue
-				}
-				for d := 0; d < numDays; d++ {
-					for h := 0; h < 24; h++ {
-						sp := spans[d][h]
-						if sp.ok && !seen[d][h] && occurrenceOverlaps(occ, dur, sp.start, sp.end) {
-							seen[d][h] = true
-							grid[d][h] = append(grid[d][h], job)
-						}
-					}
-				}
-			}
+			indexRangeJobHours(grid, seen, dayDates, spans, start, end, numDays, loc, job)
 			continue
 		}
-
-		jobLoc := job.effectiveLocation(loc)
-		if job.MatchesHour == nil {
-			if job.MatchesDay != nil {
-				for d := 0; d < numDays; d++ {
-					dayEnd := start.AddDate(0, 0, d+1)
-					if job.matchesViewerDay(dayDates[d], dayEnd, jobLoc) {
-						grid[d][0] = append(grid[d][0], job)
-					}
-				}
-			}
-			continue
-		}
-
-		legacyDur := dur
-		if legacyDur > maxLegacyDurationLookback {
-			legacyDur = maxLegacyDurationLookback
-		}
-		lookbackDays := 0
-		if legacyDur > time.Hour {
-			lookbackDays = int((legacyDur + 23*time.Hour) / (24 * time.Hour))
-		}
-		for d := -lookbackDays; d < numDays; d++ {
-			dayDate := start.AddDate(0, 0, d)
-			for h := 0; h < 24; h++ {
-				var sp hourSpan
-				if d >= 0 {
-					sp = spans[d][h]
-				} else {
-					s, e, ok := wallHourSpan(dayDate, h)
-					sp = hourSpan{start: s, end: e, ok: ok}
-				}
-				if !sp.ok {
-					continue
-				}
-				for slot := sp.start; slot.Before(sp.end); slot = slot.Add(time.Hour) {
-					jobSlot := slot.In(jobLoc)
-					if !job.MatchesHour(jobSlot) || (job.MatchesDay != nil && !job.MatchesDay(jobSlot)) {
-						continue
-					}
-					if legacyDur <= time.Hour {
-						if d >= 0 && !seen[d][h] {
-							seen[d][h] = true
-							grid[d][h] = append(grid[d][h], job)
-						}
-						break
-					}
-					for td := maxInt(0, d); td < numDays; td++ {
-						for th := 0; th < 24; th++ {
-							tsp := spans[td][th]
-							if tsp.ok && !seen[td][th] && occurrenceOverlaps(slot, legacyDur, tsp.start, tsp.end) {
-								seen[td][th] = true
-								grid[td][th] = append(grid[td][th], job)
-							}
-						}
-					}
-				}
-			}
-		}
+		indexLegacyJobHours(grid, seen, dayDates, spans, start, numDays, loc, job)
 	}
 	return grid
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // indexWeekJobs pre-computes a 7x24 hour grid for the week starting at weekStart

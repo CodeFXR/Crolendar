@@ -42,9 +42,9 @@ crolendar/
 
 ### 2.2 Provider-Agnostic View Model (`types.go`)
 All UI views consume `JobItem` and `JobProvider` rather than cron-specific structs:
-- **Provider Contract:** `JobProvider` (`Name() string`, `Load(ctx context.Context) ([]JobItem, error)`) defines the adapter boundary for Phase 2 sources.
-- **Identity & Overrides:** `JobKey{Source, ID}` indexes user `JobOverride{Alias, Color}` settings cleanly across refreshes/reorders via `effectiveJob()`.
-- **Schedule & Timezone:** `TimeZone`, `Duration`, and `OccurrencesInRange(start, end time.Time)` (with fallback to `MatchesDay`/`MatchesHour`), plus single-pass `indexWeekJobs` / `indexDayJobs` and `wallHourSpan` for DST gap and fall-back fold safety.
+- **Provider Contract:** `JobProvider` (`Name() string`, `Load(ctx context.Context) ([]JobItem, error)`) defines the adapter boundary for Phase 2 sources (adapters respect context cancellation, assign `Source`, emit unique non-empty `ID`s, and return chronological occurrences in half-open `[start, end)` intervals capped safely at `100000`).
+- **Identity & Overrides:** `JobKey{Source, ID}` indexes user `JobOverride{Alias, HasAlias, Color}` settings cleanly across refreshes/reorders via `effectiveJob()`, rejecting empty IDs and duplicate keys.
+- **Schedule & Timezone:** `TimeZone`, `Duration` (overlap expansion up to `31d` via `maxDurationLookback`), and `OccurrencesInRange(start, end time.Time)` (with fallback to `MatchesDay`/`MatchesHour` evaluated in `job.Location()` and canonical start-of-day TZ tie-breaking), plus single-pass `indexWeekJobs` / `indexDayHourJobs` / `indexDayJobs` and 15-minute `wallHourSpan` for sub-hour DST gaps and fall-back folds.
 - **Safe Accessors:** `DisplayName()`, `DisplaySchedule()`, `DisplaySource()`, `DisplayColor()`, and `LipglossColor()` enforce sanitization and valid `#RRGGBB` fallback (`#0052D4`).
 
 ### 2.3 Views (`ui_*.go`)

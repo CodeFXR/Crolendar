@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func renderSettingsView(m model, availWidth, bodyHeight int) string {
@@ -71,14 +72,14 @@ func renderSettingsView(m model, availWidth, bodyHeight int) string {
 			} else if m.settingsState == 2 && m.settingsDraftAlias != "" {
 				aliasVal = truncateWidth(m.settingsDraftAlias, maxLineWidth-13)
 			}
-			itemLines = append(itemLines, detailStyle.Render(fmt.Sprintf("Alias: %s", aliasVal)))
+			itemLines = append(itemLines, detailStyle.Render(ansi.Truncate(fmt.Sprintf("Alias: %s", aliasVal), maxLineWidth-6, "")))
 
 			swatch := lipgloss.NewStyle().Foreground(lipgloss.Color(colorHex)).Render("■")
 			colorRow := fmt.Sprintf("Color: %s %s", colorHex, swatch)
 			if m.settingsState == 2 {
 				colorRow = fmt.Sprintf("Color: %s", m.input.View())
 			}
-			itemLines = append(itemLines, detailStyle.Render(colorRow))
+			itemLines = append(itemLines, detailStyle.Render(ansi.Truncate(colorRow, maxLineWidth-6, "")))
 
 			if m.settingsError != "" {
 				itemLines = append(itemLines, errorTextStyle.PaddingLeft(6).Render(truncateWidth(m.settingsError, maxLineWidth-6)))

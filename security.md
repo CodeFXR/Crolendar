@@ -134,6 +134,16 @@ This document records all security vulnerabilities and functional/layout bugs id
 - **Patch:** Raised `maxOccurrencesPerQuery` (`100000`) and `maxDurationLookback` (`366d`), switched `wallHourSpan` to 15-minute steps, evaluated both `MatchesDay` and all fall-back folds consistently, added multi-TZ interval overlap via `matchesViewerDay`, preserved fallback timezone on load error, added `sanitizeLiveInput()`, extended `ansiEscapeRe` to C1 DCS/SOS/PM/APC, and blocked editing duplicate `(Source, ID)` keys.
 - **Regression Tests:** `TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates` (`ui_test.go`).
 
+### SEC-14: Canonical Cross-TZ Day Tie-Break, Aligned Lookback Clamp, Span Indexing & Settings Polish (Round 4)
+- **Severity:** Medium
+- **Affected Files:** `types.go`, `main.go`, `ui_settings.go`
+- **Root Cause:**
+  1. `matchesViewerDay` matched any overlapping endpoint, double-placing cross-timezone day-only jobs (such as `America/New_York` Monday) onto both Sunday and Monday in Denver.
+  2. Duration lookback clamps differed (`366d` for range vs `31d` for legacy `MatchesHour`), and `indexHourGrid` scanned all `numDays*24` spans per occurrence on duration > 0.
+  3. Color-only Settings edits after clearing a provider alias re-pinned the title; `sanitizeLiveInput` adjusted cursor using total removed count instead of sanitized prefix length; wide CJK cursors at `44x14` could exceed line width.
+- **Patch:** Anchored `matchesViewerDay` strictly to the viewer day containing job-local midnight `00:00`, aligned `maxDurationLookback` (`31d`) across range and legacy paths, split `indexHourGrid` into modular helpers using targeted `markSpanOverlap`, preserved unchanged alias override state via `settingsInitialAlias`, switched `sanitizeLiveInput` cursor tracking to sanitized prefix length, and cell-truncated Settings input rows.
+- **Regression Tests:** `TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates` (`ui_test.go`).
+
 ---
 
 ## 3. Verification Gate

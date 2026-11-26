@@ -617,29 +617,45 @@ func TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates(t *testing.T) {
 		}
 	}
 
-	// 7. Multi-TZ MatchesDay overlap (Denver Jan 15 overlaps Jan 15 and Jan 16 in Kiritimati).
-	if err == nil {
-		kiriti, kerr := time.LoadLocation("Pacific/Kiritimati")
-		if kerr == nil {
+	// 7. Canonical cross-TZ day-only placement: map each job-local midnight 00:00 to one viewer day.
+	if denver != nil {
+		if _, kerr := time.LoadLocation("Pacific/Kiritimati"); kerr == nil {
 			kiritiJob := JobItem{
 				ID:         "kiriti-jan15",
 				TimeZone:   "Pacific/Kiritimati",
 				MatchesDay: func(d time.Time) bool { return d.Day() == 15 },
 			}
-			if !kiritiJob.OccursOnDay(time.Date(2026, 1, 15, 0, 0, 0, 0, denver)) {
-				t.Fatalf("expected Pacific/Kiritimati Jan 15 job to overlap Denver Jan 15")
+			// Kiritimati Jan 15 00:00 (+14) is Denver Jan 14 03:00 MST -> Denver Jan 14 only.
+			if !kiritiJob.OccursOnDay(time.Date(2026, 1, 14, 0, 0, 0, 0, denver)) {
+				t.Fatalf("expected Pacific/Kiritimati Jan 15 midnight to map to Denver Jan 14")
 			}
-			_ = kiriti
+			if kiritiJob.OccursOnDay(time.Date(2026, 1, 15, 0, 0, 0, 0, denver)) {
+				t.Fatalf("expected Pacific/Kiritimati Jan 15 not to double-place onto Denver Jan 15")
+			}
+		}
+		if _, nerr := time.LoadLocation("America/New_York"); nerr == nil {
+			nyMon := JobItem{
+				ID:         "ny-mon",
+				TimeZone:   "America/New_York",
+				MatchesDay: func(d time.Time) bool { return d.Weekday() == time.Monday },
+			}
+			// NY Mon 2026-01-12 00:00 EST is Denver Sun 2026-01-11 22:00 MST -> Sunday only.
+			if !nyMon.OccursOnDay(time.Date(2026, 1, 11, 0, 0, 0, 0, denver)) {
+				t.Fatalf("expected NY Monday midnight to map to Denver Sunday")
+			}
+			if nyMon.OccursOnDay(time.Date(2026, 1, 12, 0, 0, 0, 0, denver)) {
+				t.Fatalf("expected NY Monday not to double-place onto Denver Monday")
+			}
 		}
 	}
 
-	// 8. Duplicate (Source, ID) must be rejected before Settings edit, and sanitizeLiveInput scrubs BiDi.
+	// 8. Duplicate (Source, ID) must be rejected before Settings edit, and sanitizeLiveInput preserves cursor prefix.
 	mDup := newModel([]JobItem{
 		{ID: "same", Source: "cron", Title: "First"},
 		{ID: "same", Source: "cron", Title: "Second"},
-		{ID: "unique", Source: "cron", Title: "Third"},
+		{ID: "unique", Source: "cron", Title: "Third", Alias: "OrigAlias"},
 	})
-	next, _ := mDup.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	next, _ := mDup.Update(tea.WindowSizeMsg{Width: 44, Height: 14})
 	mDup = next.(model)
 	mDup = mDup.switchView(viewSettings, false)
 	mDup.focusGrid = true
@@ -651,9 +667,38 @@ func TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates(t *testing.T) {
 	mDup.settingsCursor = 2
 	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mDup = next.(model)
-	mDup.input.SetValue("bad\u202E\u200Balias")
+	// Put unsafe runes both before and after cursor and verify exact sanitized cursor index.
+	mDup.input.SetValue("a\u202Eb_after\u200B")
+	mDup.input.SetCursor(4) // "a\u202Eb_"
 	mDup.sanitizeLiveInput()
-	if mDup.input.Value() != "badalias" {
-		t.Fatalf("expected sanitizeLiveInput to scrub Cf runes leaving badalias, got %q", mDup.input.Value())
+	if mDup.input.Value() != "ab_after" || mDup.input.Position() != 3 {
+		t.Fatalf("expected value=ab_after pos=3, got %q pos=%d", mDup.input.Value(), mDup.input.Position())
+	}
+	// Wide CJK input at minimum 44x14 terminal must never overflow width.
+	mDup.input.SetValue("日本語タイトルテスト文字列")
+	mDup.input.CursorEnd()
+	outWide := mDup.View()
+	if lipgloss.Width(outWide) > 44 || lipgloss.Height(outWide) > 14 {
+		t.Fatalf("wide CJK Settings edit overflowed 44x14: got %dx%d", lipgloss.Width(outWide), lipgloss.Height(outWide))
+	}
+	// Clear provider alias, save, then do a color-only edit -> cleared alias must stay cleared (not pinned to Title).
+	mDup.input.SetValue("")
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	mDup.input.SetValue("#112233")
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	// Second edit: leave alias unchanged (showing "Third"), update color only.
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	mDup.input.SetValue("#445566")
+	next, _ = mDup.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mDup = next.(model)
+	mDup.jobs[2].Title = "Updated Upstream Title"
+	eff := mDup.effectiveJob(mDup.jobs[2])
+	if eff.DisplayName() != "Updated Upstream Title" || eff.Color != "#445566" {
+		t.Fatalf("expected cleared alias to stay cleared after color-only edit so upstream title flows through, got %+v", eff)
 	}
 }

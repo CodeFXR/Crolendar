@@ -15,23 +15,24 @@ import (
 )
 
 type model struct {
-	state              sessionState
-	width, height      int
-	cursor             time.Time
-	cursorAnchorDay    int
-	focusGrid          bool
-	viewport           viewport.Model
-	ready              bool
-	stickyHeader       string
-	jobs               []JobItem
-	overrides          map[JobKey]JobOverride
-	input              textinput.Model
-	settingsState      int // 0: List, 1: EditAlias, 2: EditColor
-	settingsCursor     int
-	settingsEditKey    JobKey
-	settingsDraftAlias string
-	settingsError      string
-	settingsNotice     string
+	state                sessionState
+	width, height        int
+	cursor               time.Time
+	cursorAnchorDay      int
+	focusGrid            bool
+	viewport             viewport.Model
+	ready                bool
+	stickyHeader         string
+	jobs                 []JobItem
+	overrides            map[JobKey]JobOverride
+	input                textinput.Model
+	settingsState        int // 0: List, 1: EditAlias, 2: EditColor
+	settingsCursor       int
+	settingsEditKey      JobKey
+	settingsInitialAlias string
+	settingsDraftAlias   string
+	settingsError        string
+	settingsNotice       string
 }
 
 func newModel(jobs []JobItem) model {
@@ -86,36 +87,37 @@ func (m model) hasDuplicateKey(key JobKey) bool {
 	return false
 }
 
+func stripUnsafeInput(s string) string {
+	if s == "" {
+		return ""
+	}
+	noEsc := ansiEscapeRe.ReplaceAllString(s, "")
+	var b strings.Builder
+	b.Grow(len(noEsc))
+	for _, r := range noEsc {
+		if isBlockedControlRune(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func (m *model) sanitizeLiveInput() {
 	raw := m.input.Value()
 	if raw == "" {
 		return
 	}
-	noEsc := ansiEscapeRe.ReplaceAllString(raw, "")
-	changed := noEsc != raw
-	var b strings.Builder
-	b.Grow(len(noEsc))
-	for _, r := range noEsc {
-		if isBlockedControlRune(r) {
-			changed = true
-			continue
-		}
-		b.WriteRune(r)
-	}
-	if !changed {
+	clean := stripUnsafeInput(raw)
+	if clean == raw {
 		return
 	}
-	pos := m.input.Position()
-	clean := b.String()
-	diff := len([]rune(raw)) - len([]rune(clean))
+	rawRunes := []rune(raw)
+	pos := clampInt(m.input.Position(), 0, len(rawRunes))
+	cleanPrefix := stripUnsafeInput(string(rawRunes[:pos]))
 	m.input.Reset()
 	m.input.SetValue(clean)
-	if diff > 0 && pos > diff {
-		pos -= diff
-	} else if pos > len([]rune(clean)) {
-		pos = len([]rune(clean))
-	}
-	m.input.SetCursor(pos)
+	m.input.SetCursor(len([]rune(cleanPrefix)))
 }
 
 func (m model) Init() tea.Cmd {
@@ -145,9 +147,9 @@ func (m model) viewportHeight() int {
 
 func (m *model) syncInputWidth() {
 	_, availWidth := m.layoutDimensions()
-	w := availWidth - 16
-	if w < 6 {
-		w = 6
+	w := availWidth - 17
+	if w < 5 {
+		w = 5
 	}
 	if w > 48 {
 		w = 48
@@ -188,6 +190,7 @@ func (m model) switchView(next sessionState, scrollToNow bool) model {
 	m.state = next
 	m.settingsState = 0
 	m.settingsEditKey = JobKey{}
+	m.settingsInitialAlias = ""
 	m.settingsDraftAlias = ""
 	m.settingsError = ""
 	m.settingsNotice = ""
@@ -303,6 +306,7 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEsc {
 		m.settingsState = 0
 		m.settingsEditKey = JobKey{}
+		m.settingsInitialAlias = ""
 		m.settingsDraftAlias = ""
 		m.settingsError = ""
 		m.input.Blur()
@@ -314,6 +318,7 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			m.settingsState = 0
 			m.settingsEditKey = JobKey{}
+			m.settingsInitialAlias = ""
 			m.settingsDraftAlias = ""
 			m.settingsError = "Job no longer available"
 			m.input.Blur()
@@ -337,16 +342,20 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.overrides == nil {
 				m.overrides = make(map[JobKey]JobOverride)
 			}
+			prevOv, hadPrev := m.overrides[m.settingsEditKey]
 			hasAlias := true
-			if m.settingsDraftAlias == "" {
+			aliasVal := m.settingsDraftAlias
+			if m.settingsDraftAlias == sanitizeText(m.settingsInitialAlias) {
+				if hadPrev {
+					hasAlias = prevOv.HasAlias
+					aliasVal = prevOv.Alias
+				} else {
+					hasAlias = false
+					aliasVal = ""
+				}
+			} else if m.settingsDraftAlias == "" {
 				// Empty alias clears any provider-set alias so Title shows.
 				hasAlias = sanitizeText(rawJob.Alias) != ""
-			} else if sanitizeText(rawJob.Alias) == "" && m.settingsDraftAlias == sanitizeText(rawJob.Title) {
-				// Leave title dynamic when unchanged and job had no provider alias.
-				hasAlias = false
-			}
-			aliasVal := m.settingsDraftAlias
-			if !hasAlias {
 				aliasVal = ""
 			}
 			m.overrides[m.settingsEditKey] = JobOverride{
@@ -355,6 +364,7 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				Color:    hex,
 			}
 			m.settingsEditKey = JobKey{}
+			m.settingsInitialAlias = ""
 			m.settingsDraftAlias = ""
 			m.settingsError = ""
 			m.settingsNotice = "Updated in-memory settings"
@@ -431,13 +441,15 @@ func (m model) handleGridKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				job := m.effectiveJob(rawJob)
+				prefill := ansi.Truncate(job.DisplayName(), m.input.CharLimit, "")
 				m.settingsState = 1
 				m.settingsEditKey = rawJob.Key()
+				m.settingsInitialAlias = prefill
 				m.settingsDraftAlias = job.DisplayName()
 				m.settingsError = ""
 				m.settingsNotice = ""
 				m.syncInputWidth()
-				m.input.SetValue(ansi.Truncate(job.DisplayName(), m.input.CharLimit, ""))
+				m.input.SetValue(prefill)
 				m.input.CursorEnd()
 				return m, m.input.Focus()
 			}
