@@ -10,24 +10,27 @@ For security defects found and patched in this codebase, see `security.md`.
 
 ```text
 crolendar/
-├── main.go          # Bubble Tea MVU entrypoint, key routing, layout bounds, status footer, --demo flag
-├── types.go         # Provider-agnostic JobItem model, view state enum, day/hour filters, demo fixtures
-├── styles.go        # Centralized Lipgloss color palette and shared component styles
-├── utils.go         # Terminal escape sanitization, UTF-8 width truncation, hex color validation
-├── ui_sidebar.go    # Left navigation sidebar with logo, view list, and focus indicator
-├── ui_agenda.go     # Split month-calendar + selected-day job detail panel
-├── ui_month.go      # Dynamic full-month grid with multi-job truncation and overflow badges
-├── ui_week.go       # 7-day Clean Strip hourly grid with sticky header and current-time line
-├── ui_day.go        # Single-day hourly timeline with schedule/source badges and current-time line
-├── ui_settings.go   # Windowed job display editor (alias and validated hex color)
-├── ui_test.go       # Unit and render-invariant test suite
-├── go.mod           # Go module definition (Bubble Tea, Bubbles, Lipgloss, x/ansi)
-├── go.sum           # Cryptographic checksums of Go dependencies
-├── crolendar.png    # Project icon asset
-├── LICENSE          # MIT license
-├── README.md        # Public repository landing README
-├── crolendar.md     # Current architecture, tree, controls, and roadmap (this file)
-└── security.md      # Patched bugs, security vulnerabilities, and regression checklist
+├── main.go               # Bubble Tea MVU entrypoint, async provider reload, flags (--demo, --crontab, --version)
+├── types.go              # Provider-agnostic JobItem model, JobProvider contract, view state, day/hour indexers
+├── providers.go          # Provider aggregator (timeouts, panic recovery, Source namespacing, key deduplication)
+├── provider_cron.go      # Read-only POSIX/Vixie cron parser (crontab -l or --crontab <path>, CRON_TZ/TZ, macros)
+├── provider_cron_test.go # Cron parser, Vixie DOM/DOW, DST, file-limit, and async Bubble Tea refresh tests
+├── styles.go             # Centralized Lipgloss color palette and shared component styles
+├── utils.go              # Terminal escape sanitization, UTF-8 width truncation, hex color validation, DST spans
+├── ui_sidebar.go         # Left navigation sidebar with logo, view list, and focus indicator
+├── ui_agenda.go          # Split month-calendar + selected-day job detail panel
+├── ui_month.go           # Dynamic full-month grid with compact fallback and overflow badges
+├── ui_week.go            # 7-day Clean Strip hourly grid with sticky header and current-time line
+├── ui_day.go             # Single-day hourly timeline with schedule/source badges and current-time line
+├── ui_settings.go        # Windowed job display editor (alias and validated hex color) and provider error state
+├── ui_test.go            # Unit and render-invariant test suite
+├── go.mod                # Go module definition (Bubble Tea, Bubbles, Lipgloss, x/ansi)
+├── go.sum                # Cryptographic checksums of Go dependencies
+├── crolendar.png         # Project icon asset
+├── LICENSE               # MIT license
+├── README.md             # Public repository landing README
+├── crolendar.md          # Current architecture, tree, controls, and roadmap (this file)
+└── security.md           # Patched bugs, security vulnerabilities, and regression checklist
 ```
 
 ---
@@ -35,10 +38,10 @@ crolendar/
 ## 2. Current Architecture
 
 ### 2.1 Model-View-Update (MVU) Loop (`main.go`)
-- `newModel(jobs []JobItem)` initializes the Bubble Tea `model` with `viewAgenda`, `time.Now()` cursor, and an inline `textinput.Model` for Settings.
+- `newModelWithProviders(jobs []JobItem, providers []JobProvider)` initializes the Bubble Tea `model` with `viewAgenda`, `time.Now()` cursor, inline `textinput.Model`, and async `LoadProviders` commands tracked by a generation counter (`loadGen`) to discard stale refreshes.
 - `layoutDimensions()` reserves 2 lines for the bottom status/keybinding footer and `sidebarFullWidth` (`21` columns: 20 content + 1 border) for the left sidebar.
 - Terminals smaller than `44x14` (`minTermWidth x minTermHeight`) render a centered resize notice instead of clipping or panicking.
-- `main()` accepts `--demo` (`false` by default). Running `./crolendar` starts with an empty job slice; `./crolendar --demo` loads in-memory `demoJobs()` fixtures for UI preview without touching system crontabs or disk files.
+- `main()` supports `--crontab <path>` (read-only crontab file), `--demo` (in-memory sample fixtures), and `--version` (`crolendar <version>`). By default `./crolendar` loads the current user's crontab via `CronProvider` (`crontab -l`) in read-only mode.
 
 ### 2.2 Provider-Agnostic View Model (`types.go`)
 All UI views consume `JobItem` and `JobProvider` rather than cron-specific structs:
@@ -63,6 +66,7 @@ All UI views consume `JobItem` and `JobProvider` rather than cron-specific struc
 | Global | `Tab` | Toggle focus between Sidebar and Grid |
 | Global | `1` – `5` | Jump directly to Agenda, Month, Week, Day, or Settings |
 | Global | `t` | Jump cursor to Today (calendar views) |
+| Global | `r` | Reload active job providers asynchronously |
 | Global | `q` / `Ctrl+c` | Quit (`q` types normally during Settings text input) |
 | Sidebar | `Up`/`k`, `Down`/`j` | Cycle active view |
 | Sidebar | `Enter`, `Right`/`l` | Focus main Grid panel |
@@ -95,13 +99,13 @@ go build -o crolendar .
 - Standardize `JobItem` view model, shared `sanitizeText` / `truncateWidth` / `normalizeHexColor` helpers, bounds guards, and responsive rendering across all 5 views.
 - Establish `ui_test.go` regression coverage under `go test -race`.
 
-### Phase 2: Multi-Source Job Providers (Next)
-- Define a read-only `JobProvider` interface returning `[]JobItem` with explicit error/status reporting.
-- Implement adapters for:
-  1. **Local Cron:** Read-only `crontab -l` / explicit `--crontab <path>` file inspection.
-  2. **systemd Timers:** Parse `systemctl list-timers --all --output=json` (user and system scopes).
-  3. **Kubernetes CronJobs:** Read-only cluster/context CronJob schedule visualization (`kubectl` or `client-go`) with namespace filtering.
-- Add source-filter toggles and per-provider status indicators in the UI.
+### Phase 2: Multi-Source Job Providers (In Progress)
+- Wired read-only `JobProvider` loader (`providers.go`) with per-provider timeouts, panic isolation, source namespacing, `(Source, ID)` deduplication, async `tea.Cmd` reload (`r`), and footer/Settings error reporting.
+- Implemented adapters:
+  1. **Local Cron (Complete):** Pure-Go POSIX/Vixie cron parser (`provider_cron.go`) supporting `crontab -l` and `--crontab <path>` (read-only, 1 MiB read limit, `CRON_TZ`/`TZ`, macros, `@reboot`, Vixie DOM/DOW semantics, DST gap safety, deterministic SHA-256 IDs).
+  2. **systemd Timers (Next):** Parse `systemctl list-timers --all --output=json` (user and system scopes).
+  3. **Kubernetes CronJobs (Planned):** Read-only cluster/context CronJob schedule visualization (`kubectl` or `client-go`) with namespace filtering.
+- Remaining Phase 2 UI: source-filter toggles and per-provider status bar summary.
 
 ### Phase 3: Persistence, Job Management & Inspection
 - Add XDG-compliant config persistence (`$XDG_CONFIG_HOME/crolendar/config.json`) using atomic temp-file writes and strict symlink/permission checks for job aliases, colors, and enabled providers.

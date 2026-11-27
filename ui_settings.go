@@ -16,16 +16,37 @@ func renderSettingsView(m model, availWidth, bodyHeight int) string {
 	headerLines := lipgloss.Height(header)
 
 	if len(m.jobs) == 0 {
+		emptyLines := []string{}
+		if m.loading {
+			emptyLines = append(emptyLines,
+				lipgloss.NewStyle().Foreground(softWhite).Bold(true).Render("Loading scheduled jobs..."),
+			)
+		} else {
+			emptyLines = append(emptyLines,
+				lipgloss.NewStyle().Foreground(softWhite).Bold(true).Render("No jobs loaded."),
+				"",
+			)
+			hasErr := false
+			for _, st := range m.providerStatuses {
+				if st.Err != nil {
+					hasErr = true
+					msg := fmt.Sprintf("%s: %s", st.Name, sanitizeText(st.Err.Error()))
+					emptyLines = append(emptyLines, errorTextStyle.Render(truncateWidth(msg, availWidth-6)))
+				}
+			}
+			if !hasErr {
+				emptyLines = append(emptyLines,
+					mutedTextStyle.Render(truncateWidth("No scheduled entries were returned by active providers.", availWidth-6)),
+				)
+			}
+			emptyLines = append(emptyLines,
+				mutedTextStyle.Render(truncateWidth("Tip: press r to reload, pass --crontab <file>, or use --demo.", availWidth-6)),
+			)
+		}
 		emptyBox := lipgloss.NewStyle().
 			Width(availWidth).
 			Padding(1, 3).
-			Render(lipgloss.JoinVertical(
-				lipgloss.Left,
-				lipgloss.NewStyle().Foreground(softWhite).Bold(true).Render("No jobs loaded."),
-				"",
-				mutedTextStyle.Render(truncateWidth("Job providers will populate here once connected.", availWidth-6)),
-				mutedTextStyle.Render(truncateWidth("Tip: run `crolendar --demo` to preview sample jobs.", availWidth-6)),
-			))
+			Render(lipgloss.JoinVertical(lipgloss.Left, emptyLines...))
 		return lipgloss.NewStyle().
 			Width(availWidth).
 			Height(bodyHeight).

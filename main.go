@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -14,6 +15,14 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// version is overridden at release build time via -ldflags "-X main.version=...".
+var version = "dev"
+
+type providersLoadedMsg struct {
+	gen    uint64
+	result ProviderLoadResult
+}
+
 type model struct {
 	state                sessionState
 	width, height        int
@@ -24,6 +33,10 @@ type model struct {
 	ready                bool
 	stickyHeader         string
 	jobs                 []JobItem
+	providers            []JobProvider
+	providerStatuses     []ProviderStatus
+	loading              bool
+	loadGen              uint64
 	overrides            map[JobKey]JobOverride
 	input                textinput.Model
 	settingsState        int // 0: List, 1: EditAlias, 2: EditColor
@@ -36,17 +49,37 @@ type model struct {
 }
 
 func newModel(jobs []JobItem) model {
+	return newModelWithProviders(jobs, nil)
+}
+
+func newModelWithProviders(jobs []JobItem, providers []JobProvider) model {
 	ti := textinput.New()
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(purple)
 	ti.CharLimit = 48
 	ti.Width = 24
 
-	return model{
+	m := model{
 		state:     viewAgenda,
 		cursor:    time.Now(),
 		jobs:      jobs,
+		providers: providers,
 		overrides: make(map[JobKey]JobOverride),
 		input:     ti,
+	}
+	if len(providers) > 0 {
+		m.loading = true
+		m.loadGen = 1
+	}
+	return m
+}
+
+func loadProvidersCmd(providers []JobProvider, gen uint64) tea.Cmd {
+	list := append([]JobProvider(nil), providers...)
+	return func() tea.Msg {
+		return providersLoadedMsg{
+			gen:    gen,
+			result: LoadProviders(context.Background(), list),
+		}
 	}
 }
 
@@ -121,7 +154,11 @@ func (m *model) sanitizeLiveInput() {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
+	tick := tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
+	if len(m.providers) > 0 {
+		return tea.Batch(tick, loadProvidersCmd(m.providers, m.loadGen))
+	}
+	return tick
 }
 
 func (m model) layoutDimensions() (bodyHeight, availWidth int) {
@@ -218,6 +255,31 @@ func (m *model) scrollViewportToCurrentHour() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case providersLoadedMsg:
+		if msg.gen < m.loadGen {
+			return m, nil
+		}
+		m.loading = false
+		m.jobs = msg.result.Jobs
+		m.providerStatuses = msg.result.Statuses
+		if len(m.jobs) == 0 {
+			m.settingsCursor = 0
+		} else {
+			m.settingsCursor = clampInt(m.settingsCursor, 0, len(m.jobs)-1)
+		}
+		if m.settingsState != 0 {
+			if _, ok := m.findJobByKey(m.settingsEditKey); !ok {
+				m.settingsState = 0
+				m.settingsEditKey = JobKey{}
+				m.settingsInitialAlias = ""
+				m.settingsDraftAlias = ""
+				m.settingsError = "Job removed during refresh"
+				m.input.Blur()
+			}
+		}
+		m = updateViewContent(m)
+		return m, nil
+
 	case time.Time:
 		m = updateViewContent(m)
 		return m, tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
@@ -266,6 +328,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.switchView(viewDay, true), nil
 		case "5":
 			return m.switchView(viewSettings, false), nil
+		case "r":
+			if len(m.providers) > 0 && !m.loading {
+				m.loadGen++
+				m.loading = true
+				return m, loadProvidersCmd(m.providers, m.loadGen)
+			}
+			return m, nil
 		case "t":
 			if m.state != viewSettings {
 				m.cursor = time.Now()
@@ -527,11 +596,29 @@ func (m model) renderFooter() string {
 	if m.state == viewSettings {
 		if m.settingsState != 0 {
 			hints = "Enter: next/save  Esc: cancel"
+		} else if len(m.providers) > 0 {
+			hints = "Tab: focus  1-5: view  j/k: select  Enter: edit  r: reload  q: quit"
 		} else {
 			hints = "Tab: focus  1-5: view  j/k: select  Enter: edit  q: quit"
 		}
 	} else if m.state == viewWeek || m.state == viewDay {
 		hints = "Tab: focus  1-5: view  t: today  h/l: day  j/k: scroll  q: quit"
+	} else if len(m.providers) > 0 {
+		hints = "Tab: focus  1-5: view  t: today  r: reload  hjkl: move  q: quit"
+	}
+
+	statusNote := ""
+	statusIsErr := false
+	if m.loading {
+		statusNote = "Loading..."
+	} else {
+		for _, st := range m.providerStatuses {
+			if st.Err != nil {
+				statusNote = fmt.Sprintf("%s error: %s", st.Name, sanitizeText(st.Err.Error()))
+				statusIsErr = true
+				break
+			}
+		}
 	}
 
 	dateInfo := lipgloss.NewStyle().Foreground(softWhite).Render(m.cursor.Format("Mon 02 Jan 2006"))
@@ -544,6 +631,13 @@ func (m model) renderFooter() string {
 	var line string
 	if remWidth <= 0 {
 		line = prefix
+	} else if statusNote != "" {
+		renderedNote := truncateWidth(statusNote, remWidth)
+		if statusIsErr {
+			line = prefix + errorTextStyle.Render(renderedNote)
+		} else {
+			line = prefix + okTextStyle.Render(renderedNote)
+		}
 	} else {
 		line = prefix + truncateWidth(hints, remWidth)
 	}
@@ -595,14 +689,24 @@ func (m model) View() string {
 
 func main() {
 	demo := flag.Bool("demo", false, "Populate UI with sample scheduled jobs")
+	crontabPath := flag.String("crontab", "", "Read cron jobs from a crontab file path (read-only)")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
-	var jobs []JobItem
-	if *demo {
-		jobs = demoJobs()
+	if *showVersion {
+		fmt.Printf("crolendar %s\n", version)
+		return
 	}
 
-	p := tea.NewProgram(newModel(jobs), tea.WithAltScreen())
+	var m model
+	if *demo {
+		m = newModel(demoJobs())
+	} else {
+		providers := []JobProvider{NewCronProvider(*crontabPath)}
+		m = newModelWithProviders(nil, providers)
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "crolendar error: %v\n", err)
 		os.Exit(1)

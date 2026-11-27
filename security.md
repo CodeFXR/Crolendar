@@ -144,6 +144,16 @@ This document records all security vulnerabilities and functional/layout bugs id
 - **Patch:** Anchored `matchesViewerDay` strictly to the viewer day containing job-local midnight `00:00`, aligned `maxDurationLookback` (`31d`) across range and legacy paths, split `indexHourGrid` into modular helpers using targeted `markSpanOverlap`, preserved unchanged alias override state via `settingsInitialAlias`, switched `sanitizeLiveInput` cursor tracking to sanitized prefix length, and cell-truncated Settings input rows.
 - **Regression Tests:** `TestRound3EdgeCasesDenseC1DSTCombosClipboardAndDuplicates` (`ui_test.go`).
 
+### SEC-15: Read-Only Cron Provider Subprocess, File, Memory & Key Hardening (Phase 2)
+- **Severity:** Preventive Controls
+- **Affected Files:** `providers.go`, `provider_cron.go`, `main.go`, `ui_settings.go`
+- **Controls Applied:**
+  1. Executed `crontab -l` strictly via `exec.CommandContext(ctx, "crontab", "-l")` with no shell invocation, a 5-second per-provider timeout, and bounded stdout/stderr buffers (`1 MiB` / `64 KiB`).
+  2. Validated `--crontab <path>` against NUL/CR/LF characters and directories, enforcing a `1 MiB` read limit via `io.LimitReader`.
+  3. Isolated panicking or failing providers in `LoadProviders`, enforced `Source` namespacing, dropped empty IDs, and deduplicated `(Source, ID)` collisions deterministically.
+  4. Bounded cron occurrence generation at the provider boundary (`maxOccurrencesPerQuery` and `maxCronSearchDays = 3660`) and skipped nonexistent spring-forward DST wall minutes.
+- **Regression Tests:** `TestParseCronExpressionsAndVixieSemantics`, `TestParseCrontabMacrosEnvTZAndSanitization`, `TestCronOccurrencesDSTSpringForwardFallBackAndBounds`, `TestCronProviderFileSecurityAndErrors`, `TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh` (`provider_cron_test.go`).
+
 ---
 
 ## 3. Verification Gate
