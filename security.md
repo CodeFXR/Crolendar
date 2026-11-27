@@ -174,6 +174,16 @@ This document records all security vulnerabilities and functional/layout bugs id
 - **Patch:** Added zero-allocation `HasOccurrenceInRange` fast path backed by bitmask `cronSchedule.hasOccurrenceIn` (`math/bits`), added `select` timeout isolation per provider in `LoadProviders`, opened files via `O_RDONLY|O_CLOEXEC|O_NONBLOCK` + fd `f.Stat` on Unix (`provider_cron_unix.go`), normalized `nil` `ctx`, bounded cron step values and loop increments against overflow, capped stored warnings at `maxCrontabWarnings` (`20`) with a suppression summary, and added per-source `mergeReloadJobs`.
 - **Regression Tests:** `TestHardeningTimeoutWarningCapNilCtxAndDense2000Render`, `TestCronProviderFIFOSwapTOCTOUNeverBlocks` (`provider_cron_test.go`, `provider_cron_unix_test.go`).
 
+### SEC-18: ProviderLoader Anti-Accumulation, Non-Blocking Name Deadline, Global Warning Cap & Quit Cancel (2026-11-27)
+- **Risk:** (1) Calling `safeProviderName(prov)` synchronously inside the `LoadProviders` timeout branch allowed a blocking `Name()` implementation to hang `wg.Wait()` past the 5-second deadline; (2) repeated manual reloads (`r`) while an uncooperative provider remained hung could spawn additional detached goroutines; (3) non-cron `WarningProvider` adapters had no loader-level warning cap or ANSI sanitization; (4) duplicate provider `Name()` values during partial reload could emit duplicate `JobKey` entries in `mergeReloadJobs`; (5) quitting via `q`/`ctrl+c` did not cancel `appCtx` until `p.Run()` returned.
+- **Fix:**
+  - Added stateful `ProviderLoader` (`providers.go`) with per-slot `busy atomic.Bool` and cached `lastName atomic.Value`: if a timed-out provider is still running, subsequent reloads immediately report `"provider timed out: previous load still running"` without spawning another goroutine while healthy sibling providers continue reloading normally.
+  - Resolved `p.Name()` strictly inside the bounded worker goroutine and delivered it via a 1-buffered channel (`nameCh`), so the `<-pCtx.Done()` branch never calls `p.Name()` synchronously and falls back immediately to `"provider-<N>"`.
+  - Enforced `sanitizeAndCapWarnings` (`maxProviderWarnings = 20` + suppressed summary) for every `WarningProvider` inside `ProviderLoader.Load`.
+  - Deduplicated retained jobs by `JobKey` in `mergeReloadJobs` (`main.go`) and invoked `m.appCancel()` on `q`/`ctrl+c` before returning `tea.Quit`.
+  - Documented the explicit concurrency, fast-unique-name, and `ctx`-cancellation contract on `JobProvider` (`types.go`).
+- **Regression Tests:** `TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap` (`provider_cron_test.go`).
+
 ---
 
 ## 3. Verification Gate

@@ -58,10 +58,11 @@ type JobOverride struct {
 	Color    string
 }
 
-// JobProvider defines the contract for future read-only job source adapters
+// JobProvider defines the contract for read-only job source adapters
 // (cron, systemd timers, Kubernetes CronJobs, etc.).
-// Implementations should respect ctx cancellation, assign Name() to each JobItem.Source,
-// and emit unique non-empty JobItem.ID values within that source.
+// Implementations MUST honor ctx cancellation promptly, return a fast, stable,
+// unique Name(), be safe for concurrent Load(ctx) calls, and emit unique
+// non-empty JobItem.ID values within their source namespace.
 type JobProvider interface {
 	Name() string
 	Load(ctx context.Context) ([]JobItem, error)

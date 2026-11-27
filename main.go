@@ -34,8 +34,10 @@ type model struct {
 	stickyHeader         string
 	jobs                 []JobItem
 	providers            []JobProvider
+	providerLoader       *ProviderLoader
 	providerStatuses     []ProviderStatus
 	appCtx               context.Context
+	appCancel            context.CancelFunc
 	loading              bool
 	loadGen              uint64
 	overrides            map[JobKey]JobOverride
@@ -61,19 +63,22 @@ func newModelWithContext(ctx context.Context, jobs []JobItem, providers []JobPro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	appCtx, appCancel := context.WithCancel(ctx)
 	ti := textinput.New()
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(purple)
 	ti.CharLimit = 48
 	ti.Width = 24
 
 	m := model{
-		state:     viewAgenda,
-		cursor:    time.Now(),
-		jobs:      jobs,
-		providers: providers,
-		appCtx:    ctx,
-		overrides: make(map[JobKey]JobOverride),
-		input:     ti,
+		state:          viewAgenda,
+		cursor:         time.Now(),
+		jobs:           jobs,
+		providers:      providers,
+		providerLoader: NewProviderLoader(providers),
+		appCtx:         appCtx,
+		appCancel:      appCancel,
+		overrides:      make(map[JobKey]JobOverride),
+		input:          ti,
 	}
 	if len(providers) > 0 {
 		m.loading = true
@@ -82,15 +87,14 @@ func newModelWithContext(ctx context.Context, jobs []JobItem, providers []JobPro
 	return m
 }
 
-func loadProvidersCmd(ctx context.Context, providers []JobProvider, gen uint64) tea.Cmd {
+func loadProvidersCmd(ctx context.Context, loader *ProviderLoader, gen uint64) tea.Cmd {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	list := append([]JobProvider(nil), providers...)
 	return func() tea.Msg {
 		return providersLoadedMsg{
 			gen:    gen,
-			result: LoadProviders(ctx, list),
+			result: loader.Load(ctx),
 		}
 	}
 }
@@ -105,10 +109,22 @@ func mergeReloadJobs(prev []JobItem, res ProviderLoadResult) []JobItem {
 	if len(failedSources) == 0 || len(prev) == 0 {
 		return res.Jobs
 	}
+	seenKeys := make(map[JobKey]struct{}, len(res.Jobs)+len(prev))
 	merged := make([]JobItem, 0, len(res.Jobs)+len(prev))
-	merged = append(merged, res.Jobs...)
+	for _, j := range res.Jobs {
+		if j.HasStableKey() {
+			seenKeys[j.Key()] = struct{}{}
+		}
+		merged = append(merged, j)
+	}
 	for _, j := range prev {
 		if failedSources[j.Source] {
+			if j.HasStableKey() {
+				if _, exists := seenKeys[j.Key()]; exists {
+					continue
+				}
+				seenKeys[j.Key()] = struct{}{}
+			}
 			merged = append(merged, j)
 		}
 	}
@@ -188,7 +204,7 @@ func (m *model) sanitizeLiveInput() {
 func (m model) Init() tea.Cmd {
 	tick := tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
 	if len(m.providers) > 0 {
-		return tea.Batch(tick, loadProvidersCmd(m.appCtx, m.providers, m.loadGen))
+		return tea.Batch(tick, loadProvidersCmd(m.appCtx, m.providerLoader, m.loadGen))
 	}
 	return tick
 }
@@ -340,6 +356,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			if m.appCancel != nil {
+				m.appCancel()
+			}
 			return m, tea.Quit
 		}
 
@@ -350,6 +369,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "q":
+			if m.appCancel != nil {
+				m.appCancel()
+			}
 			return m, tea.Quit
 		case "1":
 			return m.switchView(viewAgenda, false), nil
@@ -365,7 +387,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.providers) > 0 && !m.loading {
 				m.loadGen++
 				m.loading = true
-				return m, loadProvidersCmd(m.appCtx, m.providers, m.loadGen)
+				return m, loadProvidersCmd(m.appCtx, m.providerLoader, m.loadGen)
 			}
 			return m, nil
 		case "t":

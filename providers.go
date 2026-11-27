@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const defaultProviderTimeout = 5 * time.Second
+const (
+	defaultProviderTimeout = 5 * time.Second
+	maxProviderWarnings    = 20
+)
 
 // WarningProvider is an optional extension of JobProvider for adapters that
 // can report non-fatal parse warnings (such as skipped malformed lines).
@@ -37,64 +41,103 @@ type singleProviderOutcome struct {
 	err      error
 }
 
-// LoadProviders loads jobs from all providers concurrently under ctx, enforces a
-// hard per-provider deadline even if a provider ignores ctx, recovers panics in
-// Name() and Load(), enforces strict Source namespacing and (Source, ID) uniqueness,
-// and merges results in deterministic provider order.
-func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadResult {
-	res := ProviderLoadResult{
-		Statuses: make([]ProviderStatus, 0, len(providers)),
+type providerSlot struct {
+	provider JobProvider
+	busy     atomic.Bool
+	lastName atomic.Value // stores string
+}
+
+func (s *providerSlot) fallbackName(idx int) string {
+	if v, ok := s.lastName.Load().(string); ok && v != "" {
+		return v
 	}
-	if len(providers) == 0 {
-		return res
+	return fmt.Sprintf("provider-%d", idx+1)
+}
+
+// ProviderLoader coordinates concurrent provider reloads across a fixed set of
+// providers, ensuring a non-cooperative provider that outlives its timeout
+// cannot accumulate additional leaked goroutines on subsequent reloads.
+type ProviderLoader struct {
+	slots []*providerSlot
+}
+
+// NewProviderLoader creates a ProviderLoader for the non-nil providers in order.
+func NewProviderLoader(providers []JobProvider) *ProviderLoader {
+	slots := make([]*providerSlot, 0, len(providers))
+	for _, p := range providers {
+		if p != nil {
+			slots = append(slots, &providerSlot{provider: p})
+		}
+	}
+	return &ProviderLoader{slots: slots}
+}
+
+// Load executes all configured providers concurrently under ctx with a hard
+// per-provider deadline, panic recovery in Name() and Load(), warning capping
+// and sanitization, strict Source namespacing, and (Source, ID) uniqueness.
+func (l *ProviderLoader) Load(ctx context.Context) ProviderLoadResult {
+	if l == nil || len(l.slots) == 0 {
+		return ProviderLoadResult{}
+	}
+	res := ProviderLoadResult{
+		Statuses: make([]ProviderStatus, 0, len(l.slots)),
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	active := make([]JobProvider, 0, len(providers))
-	for _, p := range providers {
-		if p != nil {
-			active = append(active, p)
-		}
-	}
-	if len(active) == 0 {
-		return res
-	}
-
-	outcomes := make([]singleProviderOutcome, len(active))
+	outcomes := make([]singleProviderOutcome, len(l.slots))
 	var wg sync.WaitGroup
-	for i, p := range active {
+	for i, slot := range l.slots {
 		wg.Add(1)
-		go func(idx int, prov JobProvider) {
+		go func(idx int, s *providerSlot) {
 			defer wg.Done()
+			if !s.busy.CompareAndSwap(false, true) {
+				outcomes[idx] = singleProviderOutcome{
+					name: s.fallbackName(idx),
+					err:  fmt.Errorf("provider timed out: previous load still running"),
+				}
+				return
+			}
+
 			pCtx, cancel := context.WithTimeout(ctx, defaultProviderTimeout)
 			defer cancel()
 
+			nameCh := make(chan string, 1)
 			ch := make(chan singleProviderOutcome, 1)
 			go func() {
-				ch <- loadSingleProviderSafe(pCtx, prov)
+				defer s.busy.Store(false)
+				ch <- loadSingleProviderSafe(pCtx, s, nameCh)
 			}()
 
 			select {
 			case out := <-ch:
 				outcomes[idx] = out
 			case <-pCtx.Done():
+				name := s.fallbackName(idx)
+				select {
+				case n := <-nameCh:
+					if n != "" {
+						name = n
+					}
+				default:
+				}
 				outcomes[idx] = singleProviderOutcome{
-					name: safeProviderName(prov),
+					name: name,
 					err:  fmt.Errorf("provider timed out: %w", pCtx.Err()),
 				}
 			}
-		}(i, p)
+		}(i, slot)
 	}
 	wg.Wait()
 
 	seenKeys := make(map[JobKey]struct{})
 	for _, out := range outcomes {
+		warnings := sanitizeAndCapWarnings(out.warnings)
 		if out.err != nil {
 			res.Statuses = append(res.Statuses, ProviderStatus{
 				Name:     out.name,
-				Warnings: out.warnings,
+				Warnings: warnings,
 				Err:      out.err,
 			})
 			continue
@@ -125,26 +168,54 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 		res.Statuses = append(res.Statuses, ProviderStatus{
 			Name:     out.name,
 			Count:    added,
-			Warnings: out.warnings,
+			Warnings: warnings,
 		})
 	}
 	return res
 }
 
-func safeProviderName(p JobProvider) (name string) {
-	name = "provider"
-	defer func() {
-		if recover() != nil {
-			name = "provider"
-		}
-	}()
-	if n := sanitizeText(p.Name()); n != "" {
-		return n
-	}
-	return "provider"
+// LoadProviders loads jobs from all providers concurrently under ctx using a
+// fresh ProviderLoader.
+func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadResult {
+	return NewProviderLoader(providers).Load(ctx)
 }
 
-func loadSingleProviderSafe(ctx context.Context, p JobProvider) (out singleProviderOutcome) {
+func sanitizeAndCapWarnings(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	limit := maxProviderWarnings
+	// Preserve a pre-capped provider slice (e.g., maxCrontabWarnings + 1 summary line)
+	// while still enforcing a strict upper bound for any custom WarningProvider.
+	if len(raw) <= limit+1 {
+		out := make([]string, 0, len(raw))
+		for _, w := range raw {
+			if clean := sanitizeText(w); clean != "" {
+				out = append(out, clean)
+			}
+		}
+		return out
+	}
+	out := make([]string, 0, limit+1)
+	suppressed := 0
+	for _, w := range raw {
+		clean := sanitizeText(w)
+		if clean == "" {
+			continue
+		}
+		if len(out) < limit {
+			out = append(out, clean)
+		} else {
+			suppressed++
+		}
+	}
+	if suppressed > 0 {
+		out = append(out, fmt.Sprintf("%d more warning(s) suppressed", suppressed))
+	}
+	return out
+}
+
+func loadSingleProviderSafe(ctx context.Context, s *providerSlot, nameCh chan<- string) (out singleProviderOutcome) {
 	out.name = "provider"
 	defer func() {
 		if r := recover(); r != nil {
@@ -152,13 +223,18 @@ func loadSingleProviderSafe(ctx context.Context, p JobProvider) (out singleProvi
 			out.err = fmt.Errorf("provider panic: %v", r)
 		}
 	}()
-	if n := sanitizeText(p.Name()); n != "" {
+	if n := sanitizeText(s.provider.Name()); n != "" {
 		out.name = n
+		s.lastName.Store(n)
 	}
-	if wp, ok := p.(WarningProvider); ok {
+	select {
+	case nameCh <- out.name:
+	default:
+	}
+	if wp, ok := s.provider.(WarningProvider); ok {
 		out.items, out.warnings, out.err = wp.LoadWithWarnings(ctx)
 		return out
 	}
-	out.items, out.err = p.Load(ctx)
+	out.items, out.err = s.provider.Load(ctx)
 	return out
 }

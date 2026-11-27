@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -481,5 +482,124 @@ func TestHardeningTimeoutWarningCapNilCtxAndDense2000Render(t *testing.T) {
 	}
 	if elapsed := time.Since(t0); elapsed > 2*time.Second {
 		t.Fatalf("dense 2000-job Agenda+Week indexing too slow: %v", elapsed)
+	}
+}
+
+type blockingNameProvider struct {
+	unblock <-chan struct{}
+}
+
+func (b blockingNameProvider) Name() string {
+	<-b.unblock
+	return "blocked-name"
+}
+
+func (b blockingNameProvider) Load(ctx context.Context) ([]JobItem, error) {
+	return nil, nil
+}
+
+type countingHungProvider struct {
+	calls   *atomic.Int32
+	unblock <-chan struct{}
+}
+
+func (c countingHungProvider) Name() string { return "hung-adapter" }
+func (c countingHungProvider) Load(ctx context.Context) ([]JobItem, error) {
+	c.calls.Add(1)
+	<-c.unblock
+	return nil, nil
+}
+
+type noisyWarningProvider struct {
+	count int
+}
+
+func (n noisyWarningProvider) Name() string { return "noisy" }
+func (n noisyWarningProvider) Load(ctx context.Context) ([]JobItem, error) {
+	return nil, nil
+}
+func (n noisyWarningProvider) LoadWithWarnings(ctx context.Context) ([]JobItem, []string, error) {
+	warns := make([]string, n.count)
+	for i := range warns {
+		warns[i] = "\x1b[31mwarning\x1b[0m line"
+	}
+	return []JobItem{{ID: "j1", Title: "ok"}}, warns, nil
+}
+
+func TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap(t *testing.T) {
+	// 1. A provider whose Name() blocks must not defeat the deadline or hang wg.Wait().
+	unblockName := make(chan struct{})
+	defer close(unblockName)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel1()
+	t0 := time.Now()
+	res1 := LoadProviders(ctx1, []JobProvider{blockingNameProvider{unblock: unblockName}})
+	if time.Since(t0) > time.Second {
+		t.Fatalf("blocking Name() defeated deadline: took %v", time.Since(t0))
+	}
+	if len(res1.Statuses) != 1 || res1.Statuses[0].Err == nil || res1.Statuses[0].Name != "provider-1" {
+		t.Fatalf("expected timed-out fallback provider-1 status, got %+v", res1.Statuses)
+	}
+
+	// 2. ProviderLoader must not spawn extra goroutines on retry while a non-cooperative
+	// provider is still hung, while healthy sibling providers still reload normally.
+	var hungCalls atomic.Int32
+	unblockHung := make(chan struct{})
+	defer close(unblockHung)
+	loader := NewProviderLoader([]JobProvider{
+		countingHungProvider{calls: &hungCalls, unblock: unblockHung},
+		stubProvider{name: "healthy", items: []JobItem{{ID: "h1", Title: "ok"}}},
+	})
+	for attempt := 0; attempt < 3; attempt++ {
+		c, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		out := loader.Load(c)
+		cancel()
+		if len(out.Jobs) != 1 || out.Jobs[0].Source != "healthy" {
+			t.Fatalf("attempt %d: expected healthy sibling job, got %+v", attempt, out.Jobs)
+		}
+		if len(out.Statuses) != 2 || out.Statuses[0].Err == nil || out.Statuses[1].Err != nil {
+			t.Fatalf("attempt %d: unexpected statuses %+v", attempt, out.Statuses)
+		}
+	}
+	if got := hungCalls.Load(); got != 1 {
+		t.Fatalf("expected hung provider Load to be invoked only once across 3 reloads, got %d", got)
+	}
+
+	// 3. Any WarningProvider's warnings are capped and ANSI-sanitized by ProviderLoader.
+	resWarn := LoadProviders(context.Background(), []JobProvider{noisyWarningProvider{count: 500}})
+	if len(resWarn.Statuses) != 1 {
+		t.Fatalf("expected 1 status, got %d", len(resWarn.Statuses))
+	}
+	warns := resWarn.Statuses[0].Warnings
+	if len(warns) != maxProviderWarnings+1 {
+		t.Fatalf("expected %d capped warnings, got %d", maxProviderWarnings+1, len(warns))
+	}
+	if strings.Contains(warns[0], "\x1b") || warns[0] != "warning line" {
+		t.Fatalf("expected sanitized warning, got %q", warns[0])
+	}
+	if !strings.Contains(warns[len(warns)-1], "480 more warning(s) suppressed") {
+		t.Fatalf("expected suppressed warning summary, got %q", warns[len(warns)-1])
+	}
+
+	// 4. mergeReloadJobs deduplicates JobKeys even when two providers share a Source name.
+	prev := []JobItem{
+		{Source: "dup", ID: "k1", Title: "old-k1"},
+		{Source: "dup", ID: "k2", Title: "old-k2"},
+	}
+	partial := ProviderLoadResult{
+		Jobs: []JobItem{
+			{Source: "dup", ID: "k1", Title: "new-k1"},
+		},
+		Statuses: []ProviderStatus{
+			{Name: "dup", Count: 1},
+			{Name: "dup", Err: errors.New("secondary failed")},
+		},
+	}
+	merged := mergeReloadJobs(prev, partial)
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 deduplicated merged jobs, got %d (%+v)", len(merged), merged)
+	}
+	if merged[0].Title != "new-k1" || merged[1].ID != "k2" {
+		t.Fatalf("expected fresh k1 plus retained k2, got %+v", merged)
 	}
 }
