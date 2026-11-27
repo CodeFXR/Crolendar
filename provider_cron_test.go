@@ -91,6 +91,8 @@ func TestParseCrontabMacrosEnvTZAndSanitization(t *testing.T) {
 		"# Header comment",
 		"SHELL=/bin/bash",
 		`MAILTO=""`,
+		"TZ=UTC",
+		"0 8 * * * /usr/bin/mail -s \"100\\% done\" admin%stdin line 1%line 2",
 		"CRON_TZ=UTC",
 		"0 0 * * * /usr/local/bin/backup --full\r",
 		"0 0 * * * /usr/local/bin/backup --full",
@@ -102,39 +104,60 @@ func TestParseCrontabMacrosEnvTZAndSanitization(t *testing.T) {
 		"0 9 * * *",
 	}, "\n")
 
-	jobs := ParseCrontab(raw)
-	if len(jobs) != 4 {
-		t.Fatalf("expected 4 valid jobs, got %d (%+v)", len(jobs), jobs)
+	jobs, warnings := ParseCrontabWithWarnings(raw)
+	if len(jobs) != 5 {
+		t.Fatalf("expected 5 valid jobs, got %d (%+v)", len(jobs), jobs)
+	}
+	if len(warnings) != 4 {
+		t.Fatalf("expected 4 warnings (invalid CRON_TZ + 3 malformed lines), got %d (%v)", len(warnings), warnings)
+	}
+
+	// Plain TZ=UTC must NOT shift cron schedule timezone, and % stdin must be stripped while \% unescapes.
+	if jobs[0].TimeZone != "" {
+		t.Fatalf("expected plain TZ=UTC not to set schedule TimeZone, got %q", jobs[0].TimeZone)
+	}
+	if jobs[0].DisplayName() != `/usr/bin/mail -s "100% done" admin` {
+		t.Fatalf("unexpected cron %% command split: %q", jobs[0].DisplayName())
 	}
 
 	// Duplicate lines must receive distinct stable IDs.
-	if jobs[0].ID == "" || jobs[1].ID == "" || jobs[0].ID == jobs[1].ID {
-		t.Fatalf("expected distinct non-empty IDs for duplicate lines, got %q and %q", jobs[0].ID, jobs[1].ID)
+	if jobs[1].ID == "" || jobs[2].ID == "" || jobs[1].ID == jobs[2].ID {
+		t.Fatalf("expected distinct non-empty IDs for duplicate lines, got %q and %q", jobs[1].ID, jobs[2].ID)
 	}
-	if jobs[0].TimeZone != "UTC" {
-		t.Fatalf("expected first job TimeZone=UTC, got %q", jobs[0].TimeZone)
+	if jobs[1].TimeZone != "UTC" {
+		t.Fatalf("expected CRON_TZ job TimeZone=UTC, got %q", jobs[1].TimeZone)
 	}
 
 	// UTC 00:00 job must land at 17:00 MST when viewed in America/Denver.
 	denver, err := time.LoadLocation("America/Denver")
 	if err == nil {
-		grid := indexDayHourJobs([]JobItem{jobs[0]}, time.Date(2026, 1, 15, 0, 0, 0, 0, denver))
+		grid := indexDayHourJobs([]JobItem{jobs[1]}, time.Date(2026, 1, 15, 0, 0, 0, 0, denver))
 		if len(grid[17]) != 1 || len(grid[0]) != 0 {
 			t.Fatalf("expected CRON_TZ=UTC 00:00 job at 17:00 Denver, got h17=%d h0=%d", len(grid[17]), len(grid[0]))
 		}
 	}
 
 	// Invalid CRON_TZ must reset back to local (empty TimeZone), not inherit UTC.
-	if jobs[2].TimeZone != "" {
-		t.Fatalf("expected invalid CRON_TZ to reset TimeZone to empty, got %q", jobs[2].TimeZone)
+	if jobs[3].TimeZone != "" {
+		t.Fatalf("expected invalid CRON_TZ to reset TimeZone to empty, got %q", jobs[3].TimeZone)
 	}
-	if jobs[2].DisplayName() != "echo hello" {
-		t.Fatalf("expected ANSI/BiDi scrubbed from cron command, got %q", jobs[2].DisplayName())
+	if jobs[3].DisplayName() != "echo hello" {
+		t.Fatalf("expected ANSI/BiDi scrubbed from cron command, got %q", jobs[3].DisplayName())
 	}
 
 	// @reboot job must surface with ScheduleLabel="@reboot" and nil OccurrencesInRange.
-	if jobs[3].ScheduleLabel != "@reboot" || jobs[3].OccurrencesInRange != nil {
-		t.Fatalf("expected @reboot job unscheduled on calendar, got label=%q fn=%v", jobs[3].ScheduleLabel, jobs[3].OccurrencesInRange != nil)
+	if jobs[4].ScheduleLabel != "@reboot" || jobs[4].OccurrencesInRange != nil {
+		t.Fatalf("expected @reboot job unscheduled on calendar, got label=%q fn=%v", jobs[4].ScheduleLabel, jobs[4].OccurrencesInRange != nil)
+	}
+
+	// Entry cap must bound massive crontabs cleanly with a truncation warning.
+	var many strings.Builder
+	for i := 0; i < maxCrontabJobs+25; i++ {
+		many.WriteString("0 1 * * * /bin/true\n")
+	}
+	capped, capWarn := ParseCrontabWithWarnings(many.String())
+	if len(capped) != maxCrontabJobs || len(capWarn) == 0 {
+		t.Fatalf("expected cap at %d jobs with warning, got len=%d warnings=%v", maxCrontabJobs, len(capped), capWarn)
 	}
 }
 
@@ -215,6 +238,13 @@ func TestCronProviderFileSecurityAndErrors(t *testing.T) {
 		t.Fatalf("unexpected file load result: jobs=%+v err=%v", jobs, err)
 	}
 
+	// Cancelled context must abort file load cleanly.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewCronProvider(goodPath).Load(cancelledCtx); err == nil {
+		t.Fatalf("expected cancelled context to fail file load")
+	}
+
 	// Oversized (>1 MiB) file rejected.
 	bigPath := filepath.Join(dir, "huge.cron")
 	big := strings.Repeat("# padding\n", (maxCrontabBytes/10)+20)
@@ -227,27 +257,39 @@ func TestCronProviderFileSecurityAndErrors(t *testing.T) {
 }
 
 type stubProvider struct {
-	name  string
-	items []JobItem
-	err   error
-	panic bool
+	name      string
+	items     []JobItem
+	warnings  []string
+	err       error
+	panicLoad bool
+	panicName bool
 }
 
-func (s stubProvider) Name() string { return s.name }
+func (s stubProvider) Name() string {
+	if s.panicName {
+		panic("name boom")
+	}
+	return s.name
+}
 func (s stubProvider) Load(ctx context.Context) ([]JobItem, error) {
-	if s.panic {
+	if s.panicLoad {
 		panic("boom")
 	}
 	return s.items, s.err
+}
+func (s stubProvider) LoadWithWarnings(ctx context.Context) ([]JobItem, []string, error) {
+	items, err := s.Load(ctx)
+	return items, s.warnings, err
 }
 
 func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 	providers := []JobProvider{
 		stubProvider{
-			name: "cron",
+			name:     "cron",
+			warnings: []string{"line 4: skipped malformed cron entry"},
 			items: []JobItem{
 				{ID: "", Title: "DropEmptyID"},
-				{ID: "a#2", Title: "ExistingHash2"},
+				{ID: "a#2", Source: "spoofed", Title: "ExistingHash2"},
 				{ID: "a", Title: "FirstA"},
 				{ID: "a", Title: "SecondA"},
 			},
@@ -257,8 +299,11 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 			err:  errors.New("cluster unreachable"),
 		},
 		stubProvider{
-			name:  "broken",
-			panic: true,
+			name:      "broken",
+			panicLoad: true,
+		},
+		stubProvider{
+			panicName: true,
 		},
 	}
 
@@ -269,18 +314,18 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 	seen := make(map[JobKey]bool)
 	for _, j := range res.Jobs {
 		if j.Source != "cron" {
-			t.Fatalf("expected Source defaulted to cron, got %q", j.Source)
+			t.Fatalf("expected Source unconditionally enforced to cron, got %q", j.Source)
 		}
 		if seen[j.Key()] {
 			t.Fatalf("duplicate key leaked from LoadProviders: %+v", j.Key())
 		}
 		seen[j.Key()] = true
 	}
-	if len(res.Statuses) != 3 || res.Statuses[1].Err == nil || res.Statuses[2].Err == nil {
-		t.Fatalf("expected isolated error/panic statuses, got %+v", res.Statuses)
+	if len(res.Statuses) != 4 || len(res.Statuses[0].Warnings) != 1 || res.Statuses[1].Err == nil || res.Statuses[2].Err == nil || res.Statuses[3].Err == nil {
+		t.Fatalf("expected isolated warning/error/panic statuses, got %+v", res.Statuses)
 	}
 
-	// Bubble Tea async load, stale gen drop, override persistence across refresh, and bounded error rendering.
+	// Bubble Tea async load, stale gen drop, override persistence across refresh, and bounded error/warning rendering.
 	m := newModelWithProviders(nil, providers)
 	if !m.loading || m.Init() == nil {
 		t.Fatalf("expected loading=true and non-nil Init batch with providers")
@@ -310,11 +355,14 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 		t.Fatalf("expected stale gen 1 ignored during gen 2 load")
 	}
 
-	// Complete gen 2 -> override survives and footer/Settings error stays bounded at 44x14.
-	next, _ = m.Update(providersLoadedMsg{gen: 2, result: res})
+	// Failed full reload must preserve last-known jobs while displaying error status.
+	next, _ = m.Update(providersLoadedMsg{gen: 2, result: ProviderLoadResult{Statuses: res.Statuses[1:2]}})
 	m = next.(model)
+	if len(m.jobs) != 3 {
+		t.Fatalf("expected last-known 3 jobs preserved on full reload error, got %d", len(m.jobs))
+	}
 	if eff := m.effectiveJob(m.jobs[1]); eff.DisplayName() != "Pinned" || eff.Color != "#112233" {
-		t.Fatalf("expected override preserved across provider reload, got %+v", eff)
+		t.Fatalf("expected override preserved across failed reload, got %+v", eff)
 	}
 	out := m.View()
 	if lipgloss.Width(out) > 44 || lipgloss.Height(out) > 14 {
@@ -324,11 +372,29 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 		t.Fatalf("expected provider error indicator in footer, got:\n%s", ansi.Strip(out))
 	}
 
-	// Empty-job error state in Settings must render cleanly at 44x14.
-	next, _ = m.Update(providersLoadedMsg{gen: 2, result: ProviderLoadResult{Statuses: res.Statuses[1:2]}})
+	// Warning-only status must surface in footer & Settings cleanly at 44x14.
+	next, _ = m.Update(providersLoadedMsg{gen: 2, result: ProviderLoadResult{
+		Jobs:     res.Jobs,
+		Statuses: res.Statuses[:1],
+	}})
 	m = next.(model)
 	m = m.switchView(viewSettings, false)
-	outSettings := m.View()
+	outWarn := m.View()
+	if lipgloss.Width(outWarn) > 44 || lipgloss.Height(outWarn) > 14 {
+		t.Fatalf("warning Settings view overflowed 44x14: got %dx%d", lipgloss.Width(outWarn), lipgloss.Height(outWarn))
+	}
+	if !strings.Contains(ansi.Strip(outWarn), "warning") {
+		t.Fatalf("expected warning surfaced in Settings/footer, got:\n%s", ansi.Strip(outWarn))
+	}
+
+	// Initial empty-job error state in Settings must render cleanly at 44x14.
+	mEmptyErr := newModelWithProviders(nil, providers)
+	next, _ = mEmptyErr.Update(tea.WindowSizeMsg{Width: 44, Height: 14})
+	mEmptyErr = next.(model)
+	next, _ = mEmptyErr.Update(providersLoadedMsg{gen: 1, result: ProviderLoadResult{Statuses: res.Statuses[1:2]}})
+	mEmptyErr = next.(model)
+	mEmptyErr = mEmptyErr.switchView(viewSettings, false)
+	outSettings := mEmptyErr.View()
 	if lipgloss.Width(outSettings) > 44 || lipgloss.Height(outSettings) > 14 {
 		t.Fatalf("empty error Settings overflowed 44x14: got %dx%d", lipgloss.Width(outSettings), lipgloss.Height(outSettings))
 	}

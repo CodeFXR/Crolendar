@@ -35,6 +35,7 @@ type model struct {
 	jobs                 []JobItem
 	providers            []JobProvider
 	providerStatuses     []ProviderStatus
+	appCtx               context.Context
 	loading              bool
 	loadGen              uint64
 	overrides            map[JobKey]JobOverride
@@ -53,6 +54,13 @@ func newModel(jobs []JobItem) model {
 }
 
 func newModelWithProviders(jobs []JobItem, providers []JobProvider) model {
+	return newModelWithContext(context.Background(), jobs, providers)
+}
+
+func newModelWithContext(ctx context.Context, jobs []JobItem, providers []JobProvider) model {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ti := textinput.New()
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(purple)
 	ti.CharLimit = 48
@@ -63,6 +71,7 @@ func newModelWithProviders(jobs []JobItem, providers []JobProvider) model {
 		cursor:    time.Now(),
 		jobs:      jobs,
 		providers: providers,
+		appCtx:    ctx,
 		overrides: make(map[JobKey]JobOverride),
 		input:     ti,
 	}
@@ -73,14 +82,29 @@ func newModelWithProviders(jobs []JobItem, providers []JobProvider) model {
 	return m
 }
 
-func loadProvidersCmd(providers []JobProvider, gen uint64) tea.Cmd {
+func loadProvidersCmd(ctx context.Context, providers []JobProvider, gen uint64) tea.Cmd {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	list := append([]JobProvider(nil), providers...)
 	return func() tea.Msg {
 		return providersLoadedMsg{
 			gen:    gen,
-			result: LoadProviders(context.Background(), list),
+			result: LoadProviders(ctx, list),
 		}
 	}
+}
+
+func allProvidersErrored(statuses []ProviderStatus) bool {
+	if len(statuses) == 0 {
+		return false
+	}
+	for _, st := range statuses {
+		if st.Err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (m model) effectiveJob(j JobItem) JobItem {
@@ -156,7 +180,7 @@ func (m *model) sanitizeLiveInput() {
 func (m model) Init() tea.Cmd {
 	tick := tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
 	if len(m.providers) > 0 {
-		return tea.Batch(tick, loadProvidersCmd(m.providers, m.loadGen))
+		return tea.Batch(tick, loadProvidersCmd(m.appCtx, m.providers, m.loadGen))
 	}
 	return tick
 }
@@ -260,8 +284,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loading = false
-		m.jobs = msg.result.Jobs
 		m.providerStatuses = msg.result.Statuses
+		// Preserve last-known jobs if a manual refresh fails across all providers.
+		if !(len(m.jobs) > 0 && len(msg.result.Jobs) == 0 && allProvidersErrored(msg.result.Statuses)) {
+			m.jobs = msg.result.Jobs
+		}
 		if len(m.jobs) == 0 {
 			m.settingsCursor = 0
 		} else {
@@ -332,7 +359,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.providers) > 0 && !m.loading {
 				m.loadGen++
 				m.loading = true
-				return m, loadProvidersCmd(m.providers, m.loadGen)
+				return m, loadProvidersCmd(m.appCtx, m.providers, m.loadGen)
 			}
 			return m, nil
 		case "t":
@@ -609,6 +636,7 @@ func (m model) renderFooter() string {
 
 	statusNote := ""
 	statusIsErr := false
+	statusIsWarn := false
 	if m.loading {
 		statusNote = "Loading..."
 	} else {
@@ -617,6 +645,15 @@ func (m model) renderFooter() string {
 				statusNote = fmt.Sprintf("%s error: %s", st.Name, sanitizeText(st.Err.Error()))
 				statusIsErr = true
 				break
+			}
+		}
+		if !statusIsErr {
+			for _, st := range m.providerStatuses {
+				if len(st.Warnings) > 0 {
+					statusNote = fmt.Sprintf("%s: %d warning(s) (%s)", st.Name, len(st.Warnings), sanitizeText(st.Warnings[0]))
+					statusIsWarn = true
+					break
+				}
 			}
 		}
 	}
@@ -635,6 +672,8 @@ func (m model) renderFooter() string {
 		renderedNote := truncateWidth(statusNote, remWidth)
 		if statusIsErr {
 			line = prefix + errorTextStyle.Render(renderedNote)
+		} else if statusIsWarn {
+			line = prefix + warnTextStyle.Render(renderedNote)
 		} else {
 			line = prefix + okTextStyle.Render(renderedNote)
 		}
@@ -689,7 +728,7 @@ func (m model) View() string {
 
 func main() {
 	demo := flag.Bool("demo", false, "Populate UI with sample scheduled jobs")
-	crontabPath := flag.String("crontab", "", "Read cron jobs from a crontab file path (read-only)")
+	crontabPath := flag.String("crontab", "", "Read user-format crontab file path (5 fields, read-only; not /etc/crontab)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -698,12 +737,15 @@ func main() {
 		return
 	}
 
+	appCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var m model
 	if *demo {
 		m = newModel(demoJobs())
 	} else {
 		providers := []JobProvider{NewCronProvider(*crontabPath)}
-		m = newModelWithProviders(nil, providers)
+		m = newModelWithContext(appCtx, nil, providers)
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

@@ -154,6 +154,16 @@ This document records all security vulnerabilities and functional/layout bugs id
   4. Bounded cron occurrence generation at the provider boundary (`maxOccurrencesPerQuery` and `maxCronSearchDays = 3660`) and skipped nonexistent spring-forward DST wall minutes.
 - **Regression Tests:** `TestParseCronExpressionsAndVixieSemantics`, `TestParseCrontabMacrosEnvTZAndSanitization`, `TestCronOccurrencesDSTSpringForwardFallBackAndBounds`, `TestCronProviderFileSecurityAndErrors`, `TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh` (`provider_cron_test.go`).
 
+### SEC-16: Cron Consensus Hardening — FIFOs, Parse Warnings, `CRON_TZ`, `%` Splitting & Provider Isolation (Phase 2 Audit)
+- **Severity:** Medium
+- **Affected Files:** `providers.go`, `provider_cron.go`, `main.go`, `ui_settings.go`, `styles.go`
+- **Root Cause:**
+  1. `readCrontabFile` only rejected directories, allowing FIFOs/devices to block `os.Open` indefinitely while ignoring `ctx`; `loadProvidersCmd` used `context.Background()` instead of a cancellable app context.
+  2. Malformed crontab lines and invalid `CRON_TZ` directives vanished silently; plain `TZ=...` shifted schedules instead of `CRON_TZ` only; unescaped cron `%` stdin payloads stayed in displayed command titles; massive crontabs had no job count cap and Settings rendered all rows on each redraw.
+  3. `LoadProviders` called `p.Name()` outside panic recovery, trusted non-empty `item.Source` (allowing namespace spoofing), loaded providers serially, and failed reloads overwrote previously loaded jobs in `main.go`.
+- **Patch:** Enforced regular-file checks before and on the opened fd (`Mode().IsRegular()`) plus `ctx` cancellation; added `ParseCrontabWithWarnings` + `WarningProvider` surfaced in footer/Settings; restricted schedule timezone shifts to `CRON_TZ` only; split cron `%` stdin / unescaped `\%`; added `maxCrontabJobs` (`2000`) and `O(visible)` Settings row rendering; moved `p.Name()` into `loadSingleProviderSafe`, enforced `item.Source = name` unconditionally, loaded providers concurrently via `sync.WaitGroup`, and preserved last-known jobs on full reload error.
+- **Regression Tests:** `TestParseCrontabMacrosEnvTZAndSanitization`, `TestCronProviderFileSecurityAndErrors`, `TestCronProviderRejectsFIFOWithoutBlocking`, `TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh` (`provider_cron_test.go`, `provider_cron_unix_test.go`).
+
 ---
 
 ## 3. Verification Gate

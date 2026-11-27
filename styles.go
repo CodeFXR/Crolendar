@@ -11,6 +11,7 @@ var (
 	borderGray = lipgloss.Color("#3C3C3C")
 	surfaceBg  = lipgloss.Color("#1A1E29")
 	errorRed   = lipgloss.Color("#F87171")
+	warnAmber  = lipgloss.Color("#F59E0B")
 	okGreen    = lipgloss.Color("#34D399")
 
 	navItemStyle          = lipgloss.NewStyle().Foreground(softWhite)
@@ -37,5 +38,6 @@ var (
 
 	mutedTextStyle = lipgloss.NewStyle().Foreground(mutedGray)
 	errorTextStyle = lipgloss.NewStyle().Foreground(errorRed)
+	warnTextStyle  = lipgloss.NewStyle().Foreground(warnAmber)
 	okTextStyle    = lipgloss.NewStyle().Foreground(okGreen)
 )

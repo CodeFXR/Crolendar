@@ -17,6 +17,7 @@ import (
 
 const (
 	maxCrontabBytes    = 1 << 20 // 1 MiB read limit
+	maxCrontabJobs     = 2000    // per-file entry cap to protect UI responsiveness
 	maxCronSearchDays  = 3660    // 10-year safety bound for occurrence search
 	cronProviderSource = "cron"
 )
@@ -66,20 +67,31 @@ func (p CronProvider) Name() string {
 }
 
 func (p CronProvider) Load(ctx context.Context) ([]JobItem, error) {
+	items, _, err := p.LoadWithWarnings(ctx)
+	return items, err
+}
+
+func (p CronProvider) LoadWithWarnings(ctx context.Context) ([]JobItem, []string, error) {
 	var raw string
 	var err error
 	if p.FilePath != "" {
-		raw, err = readCrontabFile(p.FilePath)
+		raw, err = readCrontabFile(ctx, p.FilePath)
 	} else {
 		raw, err = readSystemCrontab(ctx)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return ParseCrontab(raw), nil
+	items, warnings := ParseCrontabWithWarnings(raw)
+	return items, warnings, nil
 }
 
-func readCrontabFile(path string) (string, error) {
+func readCrontabFile(ctx context.Context, path string) (string, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("crontab read cancelled: %w", err)
+		}
+	}
 	if strings.ContainsAny(path, "\x00\r\n") {
 		return "", errors.New("invalid crontab file path")
 	}
@@ -87,14 +99,22 @@ func readCrontabFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read crontab file: %w", err)
 	}
-	if info.IsDir() {
-		return "", errors.New("crontab path is a directory")
+	if !info.Mode().IsRegular() {
+		return "", errors.New("crontab path must be a regular file")
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open crontab file: %w", err)
 	}
 	defer f.Close()
+
+	fdInfo, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat crontab file: %w", err)
+	}
+	if !fdInfo.Mode().IsRegular() {
+		return "", errors.New("crontab path must be a regular file")
+	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxCrontabBytes+1))
 	if err != nil {
@@ -225,30 +245,46 @@ func (s cronSchedule) occurrences(start, end time.Time, loc *time.Location) []ti
 	return out
 }
 
-// ParseCrontab parses POSIX/Vixie crontab text into provider-agnostic JobItems.
+// ParseCrontab parses POSIX/Vixie user-crontab text into provider-agnostic JobItems.
 // Malformed lines are skipped safely without aborting valid entries.
 func ParseCrontab(content string) []JobItem {
+	items, _ := ParseCrontabWithWarnings(content)
+	return items
+}
+
+// ParseCrontabWithWarnings parses POSIX/Vixie user-crontab text into JobItems and
+// returns non-fatal warnings for skipped malformed lines, invalid CRON_TZ directives,
+// or entry-cap truncation.
+func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 	var jobs []JobItem
+	var warnings []string
 	var currentTZ string
 	currentLoc := time.Local
 	seenIDs := make(map[string]int)
 
 	lines := strings.Split(content, "\n")
-	for _, rawLine := range lines {
+	for idx, rawLine := range lines {
+		lineNo := idx + 1
 		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
 		if key, val, ok := parseCronEnvLine(line); ok {
-			if key == "CRON_TZ" || key == "TZ" {
+			// Only CRON_TZ changes cron schedule interpretation; TZ sets the
+			// child command runtime environment and does not shift the schedule.
+			if key == "CRON_TZ" {
 				tz := sanitizeText(val)
-				if loc, err := time.LoadLocation(tz); tz != "" && err == nil {
+				if tz == "" {
+					currentTZ = ""
+					currentLoc = time.Local
+				} else if loc, err := time.LoadLocation(tz); err == nil {
 					currentTZ = tz
 					currentLoc = loc
 				} else {
 					currentTZ = ""
 					currentLoc = time.Local
+					warnings = append(warnings, fmt.Sprintf("line %d: invalid CRON_TZ %q (using local)", lineNo, tz))
 				}
 			}
 			continue
@@ -256,12 +292,19 @@ func ParseCrontab(content string) []JobItem {
 
 		schedLabel, sched, isReboot, command, ok := parseCronJobLine(line)
 		if !ok {
+			warnings = append(warnings, fmt.Sprintf("line %d: skipped malformed cron entry", lineNo))
 			continue
 		}
 
-		cleanCmd := sanitizeText(command)
+		cleanCmd := sanitizeText(splitCronCommand(command))
 		if cleanCmd == "" {
+			warnings = append(warnings, fmt.Sprintf("line %d: skipped empty command", lineNo))
 			continue
+		}
+
+		if len(jobs) >= maxCrontabJobs {
+			warnings = append(warnings, fmt.Sprintf("truncated at %d cron jobs", maxCrontabJobs))
+			break
 		}
 
 		baseID, colorHex := cronJobIdentity(schedLabel, cleanCmd, currentTZ)
@@ -290,7 +333,26 @@ func ParseCrontab(content string) []JobItem {
 		}
 		jobs = append(jobs, item)
 	}
-	return jobs
+	return jobs, warnings
+}
+
+// splitCronCommand returns the executed command portion before the first unescaped
+// Vixie cron '%' stdin separator, unescaping '\%' sequences to literal '%'.
+func splitCronCommand(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) && raw[i+1] == '%' {
+			b.WriteByte('%')
+			i++
+			continue
+		}
+		if raw[i] == '%' {
+			break
+		}
+		b.WriteByte(raw[i])
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func parseCronEnvLine(line string) (key, val string, ok bool) {

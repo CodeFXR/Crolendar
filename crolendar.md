@@ -100,12 +100,13 @@ go build -o crolendar .
 - Establish `ui_test.go` regression coverage under `go test -race`.
 
 ### Phase 2: Multi-Source Job Providers (In Progress)
-- Wired read-only `JobProvider` loader (`providers.go`) with per-provider timeouts, panic isolation, source namespacing, `(Source, ID)` deduplication, async `tea.Cmd` reload (`r`), and footer/Settings error reporting.
+- Wired concurrent read-only `JobProvider` loader (`providers.go`) with per-provider 5s timeouts, `Name()`/`Load()` panic isolation, unconditional `Source` namespacing, `(Source, ID)` deduplication, cancellable app context, async `tea.Cmd` reload (`r`), last-known-jobs retention on reload failure, and footer/Settings error & parse-warning surfacing.
 - Implemented adapters:
-  1. **Local Cron (Complete):** Pure-Go POSIX/Vixie cron parser (`provider_cron.go`) supporting `crontab -l` and `--crontab <path>` (read-only, 1 MiB read limit, `CRON_TZ`/`TZ`, macros, `@reboot`, Vixie DOM/DOW semantics, DST gap safety, deterministic SHA-256 IDs).
+  1. **Local Cron (Complete):** Pure-Go POSIX/Vixie user-crontab parser (`provider_cron.go`) supporting `crontab -l` and `--crontab <path>` (user 5-field format only, not `/etc/crontab` 6-field system format; regular files only with `1 MiB` / `2000` job caps; `CRON_TZ` schedule timezone while `TZ` remains child-env only; Vixie DOM/DOW OR/AND semantics; `%` stdin splitting and `\%` unescaping; malformed line warnings).
+     - **Documented cron semantics:** Nonexistent spring-forward DST wall minutes are skipped (cronie may catch up late after the jump); fall-back repeated minutes emit once on the first fold; `@reboot` entries appear in Settings only (no calendar date); IDs are content-addressed (`cron-<sha256>` + `#N`), so editing a command/schedule generates a new ID.
   2. **systemd Timers (Next):** Parse `systemctl list-timers --all --output=json` (user and system scopes).
   3. **Kubernetes CronJobs (Planned):** Read-only cluster/context CronJob schedule visualization (`kubectl` or `client-go`) with namespace filtering.
-- Remaining Phase 2 UI: source-filter toggles and per-provider status bar summary.
+- Remaining Phase 2 UI: source-filter toggles and per-provider status summary.
 
 ### Phase 3: Persistence, Job Management & Inspection
 - Add XDG-compliant config persistence (`$XDG_CONFIG_HOME/crolendar/config.json`) using atomic temp-file writes and strict symlink/permission checks for job aliases, colors, and enabled providers.

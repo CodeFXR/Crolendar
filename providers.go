@@ -3,16 +3,25 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
 const defaultProviderTimeout = 5 * time.Second
 
+// WarningProvider is an optional extension of JobProvider for adapters that
+// can report non-fatal parse warnings (such as skipped malformed lines).
+type WarningProvider interface {
+	JobProvider
+	LoadWithWarnings(ctx context.Context) ([]JobItem, []string, error)
+}
+
 // ProviderStatus reports the load outcome of a single JobProvider.
 type ProviderStatus struct {
-	Name  string
-	Count int
-	Err   error
+	Name     string
+	Count    int
+	Warnings []string
+	Err      error
 }
 
 // ProviderLoadResult holds aggregated jobs and per-provider status from LoadProviders.
@@ -21,8 +30,16 @@ type ProviderLoadResult struct {
 	Statuses []ProviderStatus
 }
 
-// LoadProviders loads jobs from all providers sequentially under ctx, enforces
-// source namespacing and (Source, ID) uniqueness, and isolates per-provider errors.
+type singleProviderOutcome struct {
+	name     string
+	items    []JobItem
+	warnings []string
+	err      error
+}
+
+// LoadProviders loads jobs from all providers concurrently under ctx (each bounded
+// by defaultProviderTimeout), recovers panics in Name() and Load(), enforces strict
+// Source namespacing and (Source, ID) uniqueness, and merges in deterministic order.
 func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadResult {
 	res := ProviderLoadResult{
 		Statuses: make([]ProviderStatus, 0, len(providers)),
@@ -30,34 +47,49 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 	if len(providers) == 0 {
 		return res
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	active := make([]JobProvider, 0, len(providers))
+	for _, p := range providers {
+		if p != nil {
+			active = append(active, p)
+		}
+	}
+	if len(active) == 0 {
+		return res
+	}
+
+	outcomes := make([]singleProviderOutcome, len(active))
+	var wg sync.WaitGroup
+	for i, p := range active {
+		wg.Add(1)
+		go func(idx int, prov JobProvider) {
+			defer wg.Done()
+			pCtx, cancel := context.WithTimeout(ctx, defaultProviderTimeout)
+			defer cancel()
+			outcomes[idx] = loadSingleProviderSafe(pCtx, prov)
+		}(i, p)
+	}
+	wg.Wait()
 
 	seenKeys := make(map[JobKey]struct{})
-	for _, p := range providers {
-		if p == nil {
-			continue
-		}
-		name := sanitizeText(p.Name())
-		if name == "" {
-			name = "provider"
-		}
-
-		pCtx, cancel := context.WithTimeout(ctx, defaultProviderTimeout)
-		items, err := loadSingleProviderSafe(pCtx, p)
-		cancel()
-
-		if err != nil {
+	for _, out := range outcomes {
+		if out.err != nil {
 			res.Statuses = append(res.Statuses, ProviderStatus{
-				Name: name,
-				Err:  err,
+				Name:     out.name,
+				Warnings: out.warnings,
+				Err:      out.err,
 			})
 			continue
 		}
 
 		added := 0
-		for _, item := range items {
-			if item.Source == "" {
-				item.Source = name
-			}
+		for _, item := range out.items {
+			// Enforce provider namespace unconditionally so adapters cannot collide
+			// with or spoof another provider's Source namespace.
+			item.Source = out.name
 			if !item.HasStableKey() {
 				continue
 			}
@@ -76,18 +108,29 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 		}
 
 		res.Statuses = append(res.Statuses, ProviderStatus{
-			Name:  name,
-			Count: added,
+			Name:     out.name,
+			Count:    added,
+			Warnings: out.warnings,
 		})
 	}
 	return res
 }
 
-func loadSingleProviderSafe(ctx context.Context, p JobProvider) (items []JobItem, err error) {
+func loadSingleProviderSafe(ctx context.Context, p JobProvider) (out singleProviderOutcome) {
+	out.name = "provider"
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("provider panic: %v", r)
+			out.items = nil
+			out.err = fmt.Errorf("provider panic: %v", r)
 		}
 	}()
-	return p.Load(ctx)
+	if n := sanitizeText(p.Name()); n != "" {
+		out.name = n
+	}
+	if wp, ok := p.(WarningProvider); ok {
+		out.items, out.warnings, out.err = wp.LoadWithWarnings(ctx)
+		return out
+	}
+	out.items, out.err = p.Load(ctx)
+	return out
 }
