@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -106,8 +107,12 @@ func (l *ProviderLoader) Load(ctx context.Context) ProviderLoadResult {
 			nameCh := make(chan string, 1)
 			ch := make(chan singleProviderOutcome, 1)
 			go func() {
-				defer s.busy.Store(false)
-				ch <- loadSingleProviderSafe(pCtx, s, nameCh)
+				var out singleProviderOutcome
+				defer func() {
+					s.busy.Store(false)
+					ch <- out
+				}()
+				out = loadSingleProviderSafe(pCtx, s, nameCh)
 			}()
 
 			select {
@@ -185,9 +190,9 @@ func sanitizeAndCapWarnings(raw []string) []string {
 		return nil
 	}
 	limit := maxProviderWarnings
-	// Preserve a pre-capped provider slice (e.g., maxCrontabWarnings + 1 summary line)
-	// while still enforcing a strict upper bound for any custom WarningProvider.
-	if len(raw) <= limit+1 {
+	// Preserve a pre-capped provider slice (maxProviderWarnings items plus a
+	// trailing "... suppressed" summary line) without overwriting its count.
+	if len(raw) == limit+1 && strings.HasSuffix(strings.TrimSpace(raw[limit]), "suppressed") {
 		out := make([]string, 0, len(raw))
 		for _, w := range raw {
 			if clean := sanitizeText(w); clean != "" {
@@ -196,7 +201,7 @@ func sanitizeAndCapWarnings(raw []string) []string {
 		}
 		return out
 	}
-	out := make([]string, 0, limit+1)
+	out := make([]string, 0, min(len(raw), limit)+1)
 	suppressed := 0
 	for _, w := range raw {
 		clean := sanitizeText(w)

@@ -184,6 +184,14 @@ This document records all security vulnerabilities and functional/layout bugs id
   - Documented the explicit concurrency, fast-unique-name, and `ctx`-cancellation contract on `JobProvider` (`types.go`).
 - **Regression Tests:** `TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap` (`provider_cron_test.go`).
 
+### SEC-19: Explicit Earlier-Fold DST Resolution, Exact Warning Cap Boundary & Lockstep Slot Release (2026-11-27)
+- **Risk:** (1) Go's `time.Date` does not specify which fold it returns for ambiguous fall-back wall times, so relying on `time.Date` alone did not guarantee the agreed Vixie earlier-fold behavior across runtimes/timezones; (2) `sanitizeAndCapWarnings` bypassed capping when a custom `WarningProvider` returned exactly `maxProviderWarnings + 1` raw warnings; (3) releasing `slot.busy` after sending on `ch` left a narrow scheduling window where an immediate back-to-back reload could observe `busy == true`.
+- **Fix:**
+  - Added zero-allocation `earlierWallMinute` (`provider_cron.go`) using `time.Time.ZoneBounds()` to detect any fall-back transition shift (including 60m and 30m shifts such as `America/Denver` and `Australia/Lord_Howe`) and explicitly resolve the earlier fold in both `occurrences` and `hasOccurrenceIn`.
+  - Tightened `sanitizeAndCapWarnings` (`providers.go`) so only a pre-capped trailing `"suppressed"` summary is preserved while any `21+` raw warnings are strictly capped at `20` plus summary.
+  - Cleared `s.busy.Store(false)` strictly before sending the completed outcome on `ch` (`providers.go`).
+- **Regression Tests:** `TestCronOccurrencesDSTSpringForwardFallBackAndBounds` (explicit earlier-fold UTC offset + fold-window assertions for `America/Denver` and `Australia/Lord_Howe`), `TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap` (`provider_cron_test.go`).
+
 ---
 
 ## 3. Verification Gate

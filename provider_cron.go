@@ -193,6 +193,30 @@ func (s cronSchedule) matchesDate(t time.Time) bool {
 	return domMatch || dowMatch
 }
 
+// earlierWallMinute resolves wall time (y, m, d, h, min) in loc.
+// It returns (_, false) for nonexistent spring-forward DST gap minutes, and
+// explicitly selects the earlier (first) fold on ambiguous fall-back wall times
+// regardless of which fold time.Date chooses (matching Vixie cron semantics).
+func earlierWallMinute(y int, m time.Month, d, h, min int, loc *time.Location) (time.Time, bool) {
+	ts := time.Date(y, m, d, h, min, 0, 0, loc)
+	if ts.Year() != y || ts.Month() != m || ts.Day() != d || ts.Hour() != h || ts.Minute() != min {
+		return time.Time{}, false
+	}
+	if start, _ := ts.ZoneBounds(); !start.IsZero() {
+		if delta := ts.Sub(start); delta >= 0 && delta < 24*time.Hour {
+			_, prevOff := start.Add(-time.Second).Zone()
+			_, curOff := ts.Zone()
+			if shift := prevOff - curOff; shift > 0 {
+				earlier := ts.Add(-time.Duration(shift) * time.Second)
+				if earlier.Year() == y && earlier.Month() == m && earlier.Day() == d && earlier.Hour() == h && earlier.Minute() == min {
+					return earlier, true
+				}
+			}
+		}
+	}
+	return ts, true
+}
+
 func (s cronSchedule) hasOccurrenceIn(start, end time.Time, loc *time.Location) bool {
 	if !start.Before(end) {
 		return false
@@ -207,15 +231,15 @@ func (s cronSchedule) hasOccurrenceIn(start, end time.Time, loc *time.Location) 
 		if (s.hour & (1 << uint(sh))) != 0 {
 			sy, sm, sd := sLoc.Date()
 			if sLoc.Second() == 0 && sLoc.Nanosecond() == 0 && (s.minute&(1<<uint(sLoc.Minute()))) != 0 {
-				if time.Date(sy, sm, sd, sh, sLoc.Minute(), 0, 0, loc).Equal(sLoc) {
+				if ts, ok := earlierWallMinute(sy, sm, sd, sh, sLoc.Minute(), loc); ok && ts.Equal(sLoc) {
 					return true
 				}
 			}
 			for mMask := s.minute; mMask != 0; {
 				min := bits.TrailingZeros64(mMask)
 				mMask &^= 1 << uint(min)
-				ts := time.Date(sy, sm, sd, sh, min, 0, 0, loc)
-				if ts.Year() != sy || ts.Month() != sm || ts.Day() != sd || ts.Hour() != sh || ts.Minute() != min {
+				ts, ok := earlierWallMinute(sy, sm, sd, sh, min, loc)
+				if !ok {
 					continue
 				}
 				if !ts.Before(start) && ts.Before(end) {
@@ -250,8 +274,8 @@ func (s cronSchedule) hasOccurrenceIn(start, end time.Time, loc *time.Location) 
 				for mMask := s.minute; mMask != 0; {
 					min := bits.TrailingZeros64(mMask)
 					mMask &^= 1 << uint(min)
-					ts := time.Date(y, m, d, h, min, 0, 0, loc)
-					if ts.Year() != y || ts.Month() != m || ts.Day() != d || ts.Hour() != h || ts.Minute() != min {
+					ts, ok := earlierWallMinute(y, m, d, h, min, loc)
+					if !ok {
 						continue
 					}
 					if !ts.Before(start) && ts.Before(end) {
@@ -290,9 +314,8 @@ func (s cronSchedule) occurrences(start, end time.Time, loc *time.Location) []ti
 				for mMask := s.minute; mMask != 0; {
 					min := bits.TrailingZeros64(mMask)
 					mMask &^= 1 << uint(min)
-					ts := time.Date(y, m, d, h, min, 0, 0, loc)
-					// Skip nonexistent spring-forward DST wall minutes.
-					if ts.Year() != y || ts.Month() != m || ts.Day() != d || ts.Hour() != h || ts.Minute() != min {
+					ts, ok := earlierWallMinute(y, m, d, h, min, loc)
+					if !ok {
 						continue
 					}
 					if ts.Before(start) || !ts.Before(end) {

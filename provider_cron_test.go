@@ -180,7 +180,8 @@ func TestCronOccurrencesDSTSpringForwardFallBackAndBounds(t *testing.T) {
 			t.Fatalf("expected spring-forward 02:30 skipped on Mar 8 and fired Mar 9, got %v", occs)
 		}
 
-		// Fall-back 2026-11-01: 01:30 fires once cleanly in ascending order.
+		// Fall-back 2026-11-01: 01:30 fires once on the earlier fold (MDT, -06:00 = 07:30 UTC),
+		// never on the repeated later fold (MST, -07:00 = 08:30 UTC).
 		fallSched, _ := parseCronExpression("30 1 * * *")
 		fStart := time.Date(2026, 11, 1, 0, 0, 0, 0, denver)
 		fEnd := time.Date(2026, 11, 2, 0, 0, 0, 0, denver)
@@ -188,9 +189,22 @@ func TestCronOccurrencesDSTSpringForwardFallBackAndBounds(t *testing.T) {
 		if len(fOccs) != 1 || fOccs[0].Hour() != 1 || fOccs[0].Minute() != 30 {
 			t.Fatalf("expected single 01:30 fall-back occurrence, got %v", fOccs)
 		}
+		if _, off := fOccs[0].Zone(); off != -6*3600 {
+			t.Fatalf("expected earlier fall-back fold offset -21600 (MDT), got %d (%v)", off, fOccs[0])
+		}
+		firstFoldStart := time.Date(2026, 11, 1, 7, 0, 0, 0, time.UTC)  // 01:00 MDT
+		secondFoldStart := time.Date(2026, 11, 1, 8, 0, 0, 0, time.UTC) // 01:00 MST
+		secondFoldEnd := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)   // 02:00 MST
+		if !fallSched.hasOccurrenceIn(firstFoldStart, secondFoldStart, denver) {
+			t.Fatalf("expected hasOccurrenceIn true for earlier fall-back fold [01:00 MDT, 01:00 MST)")
+		}
+		if fallSched.hasOccurrenceIn(secondFoldStart, secondFoldEnd, denver) {
+			t.Fatalf("expected hasOccurrenceIn false for later fall-back fold [01:00 MST, 02:00 MST)")
+		}
 	}
 
 	// Lord Howe 30m spring-forward (2026-10-04 02:00 -> 02:30): 02:15 skipped, 02:45 fires.
+	// Also test 30m fall-back (2026-04-05 02:00 +11:00 -> 01:30 +10:30): 01:45 fires once on +11:00.
 	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
 	if err == nil {
 		skipSched, _ := parseCronExpression("15 2 * * *")
@@ -202,6 +216,26 @@ func TestCronOccurrencesDSTSpringForwardFallBackAndBounds(t *testing.T) {
 		}
 		if got := keepSched.occurrences(lhStart, lhEnd, lordHowe); len(got) != 1 || got[0].Minute() != 45 {
 			t.Fatalf("expected Lord Howe 02:45 to fire, got %v", got)
+		}
+
+		lhFallSched, _ := parseCronExpression("45 1 * * *")
+		lhFallStart := time.Date(2026, 4, 5, 0, 0, 0, 0, lordHowe)
+		lhFallEnd := time.Date(2026, 4, 6, 0, 0, 0, 0, lordHowe)
+		lhFallOccs := lhFallSched.occurrences(lhFallStart, lhFallEnd, lordHowe)
+		if len(lhFallOccs) != 1 {
+			t.Fatalf("expected single Lord Howe 01:45 fall-back occurrence, got %v", lhFallOccs)
+		}
+		if _, off := lhFallOccs[0].Zone(); off != 11*3600 {
+			t.Fatalf("expected earlier Lord Howe fold offset +39600 (+11:00), got %d (%v)", off, lhFallOccs[0])
+		}
+		lhFirstStart := time.Date(2026, 4, 4, 14, 30, 0, 0, time.UTC) // 01:30 +11:00
+		lhSecondStart := time.Date(2026, 4, 4, 15, 0, 0, 0, time.UTC) // 01:30 +10:30
+		lhSecondEnd := time.Date(2026, 4, 4, 15, 30, 0, 0, time.UTC)  // 02:00 +10:30
+		if !lhFallSched.hasOccurrenceIn(lhFirstStart, lhSecondStart, lordHowe) {
+			t.Fatalf("expected hasOccurrenceIn true for Lord Howe earlier 30m fold")
+		}
+		if lhFallSched.hasOccurrenceIn(lhSecondStart, lhSecondEnd, lordHowe) {
+			t.Fatalf("expected hasOccurrenceIn false for Lord Howe later 30m fold")
 		}
 	}
 
@@ -565,7 +599,12 @@ func TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap(t *testi
 		t.Fatalf("expected hung provider Load to be invoked only once across 3 reloads, got %d", got)
 	}
 
-	// 3. Any WarningProvider's warnings are capped and ANSI-sanitized by ProviderLoader.
+	// 3. Any WarningProvider's warnings are capped and ANSI-sanitized by ProviderLoader,
+	// including the exact 21-raw-warning boundary.
+	resWarn21 := LoadProviders(context.Background(), []JobProvider{noisyWarningProvider{count: maxProviderWarnings + 1}})
+	if got := resWarn21.Statuses[0].Warnings; len(got) != maxProviderWarnings+1 || !strings.Contains(got[maxProviderWarnings], "1 more warning(s) suppressed") {
+		t.Fatalf("expected 21 raw warnings capped with 1 suppressed summary, got %+v", got)
+	}
 	resWarn := LoadProviders(context.Background(), []JobProvider{noisyWarningProvider{count: 500}})
 	if len(resWarn.Statuses) != 1 {
 		t.Fatalf("expected 1 status, got %d", len(resWarn.Statuses))
