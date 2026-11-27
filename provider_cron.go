@@ -433,7 +433,7 @@ func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 		jobs = append(jobs, item)
 	}
 	if suppressedWarnings > 0 {
-		warnings = append(warnings, fmt.Sprintf("... and %d more warning(s) suppressed", suppressedWarnings))
+		warnings = append(warnings, formatSuppressedWarnings(suppressedWarnings))
 	}
 	return jobs, warnings
 }

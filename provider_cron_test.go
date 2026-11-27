@@ -600,10 +600,19 @@ func TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap(t *testi
 	}
 
 	// 3. Any WarningProvider's warnings are capped and ANSI-sanitized by ProviderLoader,
-	// including the exact 21-raw-warning boundary.
+	// including the exact 21-raw-warning boundary and an ordinary 21st warning ending in "suppressed".
 	resWarn21 := LoadProviders(context.Background(), []JobProvider{noisyWarningProvider{count: maxProviderWarnings + 1}})
 	if got := resWarn21.Statuses[0].Warnings; len(got) != maxProviderWarnings+1 || !strings.Contains(got[maxProviderWarnings], "1 more warning(s) suppressed") {
 		t.Fatalf("expected 21 raw warnings capped with 1 suppressed summary, got %+v", got)
+	}
+	ordinary21 := make([]string, maxProviderWarnings+1)
+	for i := 0; i < maxProviderWarnings; i++ {
+		ordinary21[i] = "ordinary warning"
+	}
+	ordinary21[maxProviderWarnings] = "line 21: directive was suppressed"
+	resOrdinary21 := LoadProviders(context.Background(), []JobProvider{stubProvider{name: "custom", warnings: ordinary21}})
+	if got := resOrdinary21.Statuses[0].Warnings; len(got) != maxProviderWarnings+1 || got[maxProviderWarnings] != formatSuppressedWarnings(1) {
+		t.Fatalf("expected ordinary 21st warning ending in 'suppressed' to be capped, got %+v", got)
 	}
 	resWarn := LoadProviders(context.Background(), []JobProvider{noisyWarningProvider{count: 500}})
 	if len(resWarn.Statuses) != 1 {

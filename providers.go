@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,14 +186,30 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 	return NewProviderLoader(providers).Load(ctx)
 }
 
+func formatSuppressedWarnings(n int) string {
+	return fmt.Sprintf("... and %d more warning(s) suppressed", n)
+}
+
+func isSuppressedWarningSummary(s string) bool {
+	const prefix = "... and "
+	const suffix = " more warning(s) suppressed"
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, prefix) || !strings.HasSuffix(trimmed, suffix) {
+		return false
+	}
+	numStr := trimmed[len(prefix) : len(trimmed)-len(suffix)]
+	n, err := strconv.Atoi(numStr)
+	return err == nil && n > 0
+}
+
 func sanitizeAndCapWarnings(raw []string) []string {
 	if len(raw) == 0 {
 		return nil
 	}
 	limit := maxProviderWarnings
-	// Preserve a pre-capped provider slice (maxProviderWarnings items plus a
-	// trailing "... suppressed" summary line) without overwriting its count.
-	if len(raw) == limit+1 && strings.HasSuffix(strings.TrimSpace(raw[limit]), "suppressed") {
+	// Preserve a pre-capped provider slice (maxProviderWarnings items plus the
+	// canonical formatSuppressedWarnings summary line) without overwriting its count.
+	if len(raw) == limit+1 && isSuppressedWarningSummary(raw[limit]) {
 		out := make([]string, 0, len(raw))
 		for _, w := range raw {
 			if clean := sanitizeText(w); clean != "" {
@@ -215,7 +232,7 @@ func sanitizeAndCapWarnings(raw []string) []string {
 		}
 	}
 	if suppressed > 0 {
-		out = append(out, fmt.Sprintf("%d more warning(s) suppressed", suppressed))
+		out = append(out, formatSuppressedWarnings(suppressed))
 	}
 	return out
 }
