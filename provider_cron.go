@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"math/bits"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -18,6 +18,7 @@ import (
 const (
 	maxCrontabBytes    = 1 << 20 // 1 MiB read limit
 	maxCrontabJobs     = 2000    // per-file entry cap to protect UI responsiveness
+	maxCrontabWarnings = 20      // cap stored warning strings per load
 	maxCronSearchDays  = 3660    // 10-year safety bound for occurrence search
 	cronProviderSource = "cron"
 )
@@ -72,6 +73,9 @@ func (p CronProvider) Load(ctx context.Context) ([]JobItem, error) {
 }
 
 func (p CronProvider) LoadWithWarnings(ctx context.Context) ([]JobItem, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var raw string
 	var err error
 	if p.FilePath != "" {
@@ -95,26 +99,11 @@ func readCrontabFile(ctx context.Context, path string) (string, error) {
 	if strings.ContainsAny(path, "\x00\r\n") {
 		return "", errors.New("invalid crontab file path")
 	}
-	info, err := os.Stat(path)
+	f, err := openRegularFileReadOnly(path)
 	if err != nil {
-		return "", fmt.Errorf("read crontab file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("crontab path must be a regular file")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open crontab file: %w", err)
+		return "", err
 	}
 	defer f.Close()
-
-	fdInfo, err := f.Stat()
-	if err != nil {
-		return "", fmt.Errorf("stat crontab file: %w", err)
-	}
-	if !fdInfo.Mode().IsRegular() {
-		return "", errors.New("crontab path must be a regular file")
-	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxCrontabBytes+1))
 	if err != nil {
@@ -127,6 +116,9 @@ func readCrontabFile(ctx context.Context, path string) (string, error) {
 }
 
 func readSystemCrontab(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cmd := exec.CommandContext(ctx, "crontab", "-l")
 	var stdout, stderr limitedBuffer
 	stdout.limit = maxCrontabBytes + 1
@@ -201,6 +193,81 @@ func (s cronSchedule) matchesDate(t time.Time) bool {
 	return domMatch || dowMatch
 }
 
+func (s cronSchedule) hasOccurrenceIn(start, end time.Time, loc *time.Location) bool {
+	if !start.Before(end) {
+		return false
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	sLoc := start.In(loc)
+	// Fast path: check sLoc's own hour directly without building day boundaries.
+	if s.matchesDate(sLoc) {
+		sh := sLoc.Hour()
+		if (s.hour & (1 << uint(sh))) != 0 {
+			sy, sm, sd := sLoc.Date()
+			if sLoc.Second() == 0 && sLoc.Nanosecond() == 0 && (s.minute&(1<<uint(sLoc.Minute()))) != 0 {
+				if time.Date(sy, sm, sd, sh, sLoc.Minute(), 0, 0, loc).Equal(sLoc) {
+					return true
+				}
+			}
+			for mMask := s.minute; mMask != 0; {
+				min := bits.TrailingZeros64(mMask)
+				mMask &^= 1 << uint(min)
+				ts := time.Date(sy, sm, sd, sh, min, 0, 0, loc)
+				if ts.Year() != sy || ts.Month() != sm || ts.Day() != sd || ts.Hour() != sh || ts.Minute() != min {
+					continue
+				}
+				if !ts.Before(start) && ts.Before(end) {
+					return true
+				}
+			}
+		}
+	}
+
+	eLoc := end.In(loc)
+	sy, sm, sd := sLoc.Date()
+	ey, em, ed := eLoc.Date()
+	if sy == ey && sm == em && sd == ed && sLoc.Hour() == eLoc.Hour() {
+		return false
+	}
+	curDay := time.Date(sy, sm, sd, 0, 0, 0, 0, loc)
+	endDay := time.Date(ey, em, ed, 0, 0, 0, 0, loc)
+
+	for days := 0; !curDay.After(endDay) && days < maxCronSearchDays; days++ {
+		if s.matchesDate(curDay) {
+			y, m, d := curDay.Date()
+			hMask := s.hour
+			if y == sy && m == sm && d == sd && sLoc.Hour() > 0 {
+				hMask &^= (uint32(1) << uint(sLoc.Hour())) - 1
+			}
+			if y == ey && m == em && d == ed && eLoc.Hour() < 23 {
+				hMask &= (uint32(1) << uint(eLoc.Hour()+1)) - 1
+			}
+			for hMask != 0 {
+				h := bits.TrailingZeros32(hMask)
+				hMask &^= 1 << uint(h)
+				for mMask := s.minute; mMask != 0; {
+					min := bits.TrailingZeros64(mMask)
+					mMask &^= 1 << uint(min)
+					ts := time.Date(y, m, d, h, min, 0, 0, loc)
+					if ts.Year() != y || ts.Month() != m || ts.Day() != d || ts.Hour() != h || ts.Minute() != min {
+						continue
+					}
+					if !ts.Before(start) && ts.Before(end) {
+						return true
+					}
+				}
+			}
+		}
+		if curDay.Equal(endDay) {
+			break
+		}
+		curDay = curDay.AddDate(0, 0, 1)
+	}
+	return false
+}
+
 func (s cronSchedule) occurrences(start, end time.Time, loc *time.Location) []time.Time {
 	if !start.Before(end) {
 		return nil
@@ -217,14 +284,12 @@ func (s cronSchedule) occurrences(start, end time.Time, loc *time.Location) []ti
 	for days := 0; !curDay.After(endDay) && days < maxCronSearchDays; days++ {
 		if s.matchesDate(curDay) {
 			y, m, d := curDay.Date()
-			for h := 0; h < 24; h++ {
-				if (s.hour & (1 << uint(h))) == 0 {
-					continue
-				}
-				for min := 0; min < 60; min++ {
-					if (s.minute & (1 << uint(min))) == 0 {
-						continue
-					}
+			for hMask := s.hour; hMask != 0; {
+				h := bits.TrailingZeros32(hMask)
+				hMask &^= 1 << uint(h)
+				for mMask := s.minute; mMask != 0; {
+					min := bits.TrailingZeros64(mMask)
+					mMask &^= 1 << uint(min)
 					ts := time.Date(y, m, d, h, min, 0, 0, loc)
 					// Skip nonexistent spring-forward DST wall minutes.
 					if ts.Year() != y || ts.Month() != m || ts.Day() != d || ts.Hour() != h || ts.Minute() != min {
@@ -258,6 +323,14 @@ func ParseCrontab(content string) []JobItem {
 func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 	var jobs []JobItem
 	var warnings []string
+	suppressedWarnings := 0
+	addWarning := func(msg string) {
+		if len(warnings) < maxCrontabWarnings {
+			warnings = append(warnings, msg)
+		} else {
+			suppressedWarnings++
+		}
+	}
 	var currentTZ string
 	currentLoc := time.Local
 	seenIDs := make(map[string]int)
@@ -284,7 +357,7 @@ func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 				} else {
 					currentTZ = ""
 					currentLoc = time.Local
-					warnings = append(warnings, fmt.Sprintf("line %d: invalid CRON_TZ %q (using local)", lineNo, tz))
+					addWarning(fmt.Sprintf("line %d: invalid CRON_TZ %q (using local)", lineNo, tz))
 				}
 			}
 			continue
@@ -292,18 +365,18 @@ func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 
 		schedLabel, sched, isReboot, command, ok := parseCronJobLine(line)
 		if !ok {
-			warnings = append(warnings, fmt.Sprintf("line %d: skipped malformed cron entry", lineNo))
+			addWarning(fmt.Sprintf("line %d: skipped malformed cron entry", lineNo))
 			continue
 		}
 
 		cleanCmd := sanitizeText(splitCronCommand(command))
 		if cleanCmd == "" {
-			warnings = append(warnings, fmt.Sprintf("line %d: skipped empty command", lineNo))
+			addWarning(fmt.Sprintf("line %d: skipped empty command", lineNo))
 			continue
 		}
 
 		if len(jobs) >= maxCrontabJobs {
-			warnings = append(warnings, fmt.Sprintf("truncated at %d cron jobs", maxCrontabJobs))
+			addWarning(fmt.Sprintf("truncated at %d cron jobs", maxCrontabJobs))
 			break
 		}
 
@@ -327,11 +400,17 @@ func ParseCrontabWithWarnings(content string) ([]JobItem, []string) {
 		if !isReboot {
 			capturedSched := sched
 			capturedLoc := currentLoc
+			item.HasOccurrenceInRange = func(start, end time.Time) bool {
+				return capturedSched.hasOccurrenceIn(start, end, capturedLoc)
+			}
 			item.OccurrencesInRange = func(start, end time.Time) []time.Time {
 				return capturedSched.occurrences(start, end, capturedLoc)
 			}
 		}
 		jobs = append(jobs, item)
+	}
+	if suppressedWarnings > 0 {
+		warnings = append(warnings, fmt.Sprintf("... and %d more warning(s) suppressed", suppressedWarnings))
 	}
 	return jobs, warnings
 }
@@ -513,8 +592,12 @@ func parseCronField(field string, minVal, maxVal int, names map[string]int, isDO
 			if len(slashParts) != 2 || slashParts[0] == "" || slashParts[1] == "" {
 				return 0, fmt.Errorf("invalid step %q", part)
 			}
+			maxStep := maxVal - minVal + 1
+			if isDOW {
+				maxStep = 7
+			}
 			s, err := strconv.Atoi(slashParts[1])
-			if err != nil || s <= 0 {
+			if err != nil || s <= 0 || s > maxStep {
 				return 0, fmt.Errorf("invalid step %q", part)
 			}
 			step = s
@@ -569,8 +652,12 @@ func parseCronField(field string, minVal, maxVal int, names map[string]int, isDO
 			}
 		}
 
-		for v := startVal; v <= endVal; v += step {
+		for v := startVal; v <= endVal; {
 			mask |= 1 << uint(v)
+			if step > endVal-v {
+				break
+			}
+			v += step
 		}
 	}
 	if mask == 0 {

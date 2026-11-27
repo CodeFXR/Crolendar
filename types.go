@@ -79,6 +79,9 @@ type JobItem struct {
 	ScheduleLabel string
 	Color         string
 
+	// HasOccurrenceInRange (optional zero-allocation fast path for calendar bucketing)
+	// reports whether the job has at least one occurrence inside half-open [start, end).
+	HasOccurrenceInRange func(start, end time.Time) bool
 	// OccurrencesInRange (preferred for Phase 2 adapters) accepts an arbitrary timezone
 	// half-open interval [start, end) and returns chronological occurrences in [start, end).
 	OccurrencesInRange func(start, end time.Time) []time.Time
@@ -215,6 +218,9 @@ func (j JobItem) OccursOnDay(day time.Time) bool {
 	end := start.AddDate(0, 0, 1)
 	dur := j.clampedDuration()
 
+	if dur == 0 && j.HasOccurrenceInRange != nil {
+		return j.HasOccurrenceInRange(start, end)
+	}
 	if j.OccurrencesInRange != nil {
 		for _, occ := range j.boundedOccurrences(start, end) {
 			if occurrenceOverlaps(occ, dur, start, end) {
@@ -257,6 +263,9 @@ func (j JobItem) OccursInHour(hour time.Time) bool {
 		return false
 	}
 	dur := j.clampedDuration()
+	if dur == 0 && j.HasOccurrenceInRange != nil {
+		return j.HasOccurrenceInRange(start, end)
+	}
 	if j.OccurrencesInRange != nil {
 		for _, occ := range j.boundedOccurrences(start, end) {
 			if occurrenceOverlaps(occ, dur, start, end) {
@@ -336,6 +345,14 @@ func indexDayJobs(jobs []JobItem, startDay time.Time, numDays int) [][]JobItem {
 	}
 
 	for _, job := range jobs {
+		if job.clampedDuration() == 0 && job.HasOccurrenceInRange != nil {
+			for d := 0; d < numDays; d++ {
+				if job.HasOccurrenceInRange(dayDates[d], dayEnds[d]) {
+					grid[d] = append(grid[d], job)
+				}
+			}
+			continue
+		}
 		if job.OccurrencesInRange != nil {
 			dur := job.clampedDuration()
 			seen := make([]bool, numDays)
@@ -549,6 +566,17 @@ func indexHourGrid(jobs []JobItem, startDay time.Time, numDays int) [][24][]JobI
 	dayDates, spans := buildHourSpans(start, numDays)
 
 	for _, job := range jobs {
+		if job.clampedDuration() == 0 && job.HasOccurrenceInRange != nil {
+			for d := 0; d < numDays; d++ {
+				for h := 0; h < 24; h++ {
+					sp := spans[d][h]
+					if sp.ok && job.HasOccurrenceInRange(sp.start, sp.end) {
+						grid[d][h] = append(grid[d][h], job)
+					}
+				}
+			}
+			continue
+		}
 		seen := make([][24]bool, numDays)
 		if job.OccurrencesInRange != nil {
 			indexRangeJobHours(grid, seen, dayDates, spans, start, end, numDays, loc, job)

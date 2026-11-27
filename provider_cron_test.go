@@ -73,6 +73,9 @@ func TestParseCronExpressionsAndVixieSemantics(t *testing.T) {
 		"* * * 13 *",
 		"* * * * 8",
 		"*/0 * * * *",
+		"*/61 * * * *",
+		"1/9223372036854775807 * * * *",
+		"2/9223372036854775807 * * * *",
 		"5-2 * * * *",
 		"1,,2 * * * *",
 		"1/2/3 * * * *",
@@ -355,20 +358,35 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 		t.Fatalf("expected stale gen 1 ignored during gen 2 load")
 	}
 
-	// Failed full reload must preserve last-known jobs while displaying error status.
-	next, _ = m.Update(providersLoadedMsg{gen: 2, result: ProviderLoadResult{Statuses: res.Statuses[1:2]}})
+	// Partial reload: cron errors while systemd succeeds -> retain last-known cron jobs AND apply new systemd job.
+	next, _ = m.Update(providersLoadedMsg{gen: 2, result: ProviderLoadResult{
+		Jobs: []JobItem{{ID: "sys-1", Source: "systemd", Title: "Timer One"}},
+		Statuses: []ProviderStatus{
+			{Name: "cron", Err: errors.New("crontab unavailable")},
+			{Name: "systemd", Count: 1},
+		},
+	}})
 	m = next.(model)
-	if len(m.jobs) != 3 {
-		t.Fatalf("expected last-known 3 jobs preserved on full reload error, got %d", len(m.jobs))
+	if len(m.jobs) != 4 {
+		t.Fatalf("expected 1 new systemd job + 3 retained cron jobs on partial reload failure, got %d", len(m.jobs))
 	}
-	if eff := m.effectiveJob(m.jobs[1]); eff.DisplayName() != "Pinned" || eff.Color != "#112233" {
-		t.Fatalf("expected override preserved across failed reload, got %+v", eff)
+	foundPinned := false
+	for _, j := range m.jobs {
+		if j.Key() == firstKey {
+			eff := m.effectiveJob(j)
+			if eff.DisplayName() == "Pinned" && eff.Color == "#112233" {
+				foundPinned = true
+			}
+		}
+	}
+	if !foundPinned {
+		t.Fatalf("expected override preserved on retained cron job across partial reload error")
 	}
 	out := m.View()
 	if lipgloss.Width(out) > 44 || lipgloss.Height(out) > 14 {
 		t.Fatalf("provider error footer overflowed 44x14: got %dx%d", lipgloss.Width(out), lipgloss.Height(out))
 	}
-	if !strings.Contains(ansi.Strip(out), "k8s") {
+	if !strings.Contains(ansi.Strip(out), "cron") {
 		t.Fatalf("expected provider error indicator in footer, got:\n%s", ansi.Strip(out))
 	}
 
@@ -397,5 +415,71 @@ func TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh(t *testing.T) {
 	outSettings := mEmptyErr.View()
 	if lipgloss.Width(outSettings) > 44 || lipgloss.Height(outSettings) > 14 {
 		t.Fatalf("empty error Settings overflowed 44x14: got %dx%d", lipgloss.Width(outSettings), lipgloss.Height(outSettings))
+	}
+}
+
+type blockingProvider struct {
+	unblock chan struct{}
+}
+
+func (b blockingProvider) Name() string { return "stuck" }
+func (b blockingProvider) Load(ctx context.Context) ([]JobItem, error) {
+	<-b.unblock
+	return nil, nil
+}
+
+func TestHardeningTimeoutWarningCapNilCtxAndDense2000Render(t *testing.T) {
+	// 1. Non-cooperative provider that ignores ctx must NOT block LoadProviders past ctx deadline.
+	unblock := make(chan struct{})
+	defer close(unblock)
+	shortCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := LoadProviders(shortCtx, []JobProvider{blockingProvider{unblock: unblock}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("LoadProviders blocked on non-cooperative provider: %v", elapsed)
+	}
+	if len(res.Statuses) != 1 || res.Statuses[0].Err == nil {
+		t.Fatalf("expected timeout error status for stuck provider, got %+v", res.Statuses)
+	}
+
+	// 2. Warning cap: 500 malformed lines must be capped at maxCrontabWarnings+1 with suppressed summary.
+	badMany := strings.Repeat("not a valid cron line\n", 500)
+	_, warns := ParseCrontabWithWarnings(badMany)
+	if len(warns) != maxCrontabWarnings+1 || !strings.Contains(warns[len(warns)-1], "suppressed") {
+		t.Fatalf("expected capped %d warnings with suppressed notice, got %d (%v)", maxCrontabWarnings+1, len(warns), warns)
+	}
+
+	// 3. CronProvider.Load(nil) must never panic (file path and nil ctx normalization).
+	dir := t.TempDir()
+	p := filepath.Join(dir, "ok.cron")
+	if err := os.WriteFile(p, []byte("0 5 * * * /bin/echo ok\n"), 0600); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	var nilCtx context.Context
+	if jobs, err := NewCronProvider(p).Load(nilCtx); err != nil || len(jobs) != 1 {
+		t.Fatalf("expected nil ctx file load to succeed cleanly, got jobs=%d err=%v", len(jobs), err)
+	}
+	// Also test readSystemCrontab(nil) does not panic even if crontab binary missing/empty.
+	_, _ = readSystemCrontab(nilCtx)
+
+	// 4. Dense 2,000 * * * * * jobs over 42-day Agenda and 7-day Week must finish fast with HasOccurrenceInRange.
+	var dense strings.Builder
+	for i := 0; i < maxCrontabJobs; i++ {
+		dense.WriteString("* * * * * /bin/true\n")
+	}
+	denseJobs := ParseCrontab(dense.String())
+	if len(denseJobs) != maxCrontabJobs {
+		t.Fatalf("expected %d dense jobs, got %d", maxCrontabJobs, len(denseJobs))
+	}
+	t0 := time.Now()
+	dStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	dGrid := indexDayJobs(denseJobs, dStart, 42)
+	wGrid := indexWeekJobs(denseJobs, dStart)
+	if len(dGrid[41]) != maxCrontabJobs || len(wGrid[6][23]) != maxCrontabJobs {
+		t.Fatalf("expected all %d dense jobs indexed on day 42 and week day 6 h23", maxCrontabJobs)
+	}
+	if elapsed := time.Since(t0); elapsed > 2*time.Second {
+		t.Fatalf("dense 2000-job Agenda+Week indexing too slow: %v", elapsed)
 	}
 }

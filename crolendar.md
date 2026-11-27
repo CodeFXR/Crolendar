@@ -13,8 +13,11 @@ crolendar/
 ├── main.go               # Bubble Tea MVU entrypoint, async provider reload, flags (--demo, --crontab, --version)
 ├── types.go              # Provider-agnostic JobItem model, JobProvider contract, view state, day/hour indexers
 ├── providers.go          # Provider aggregator (timeouts, panic recovery, Source namespacing, key deduplication)
-├── provider_cron.go      # Read-only POSIX/Vixie cron parser (crontab -l or --crontab <path>, CRON_TZ/TZ, macros)
-├── provider_cron_test.go # Cron parser, Vixie DOM/DOW, DST, file-limit, and async Bubble Tea refresh tests
+├── provider_cron.go           # Read-only POSIX/Vixie cron parser (crontab -l or --crontab <path>, CRON_TZ, macros)
+├── provider_cron_unix.go      # Unix O_NONBLOCK regular-file open helper preventing FIFO TOCTOU hangs
+├── provider_cron_other.go     # Non-Unix regular-file open helper for cross-platform builds
+├── provider_cron_test.go      # Cron parser, Vixie DOM/DOW, DST, warning-cap, 2000-job perf, and reload tests
+├── provider_cron_unix_test.go # Unix FIFO and concurrent FIFO-swap TOCTOU regression tests
 ├── styles.go             # Centralized Lipgloss color palette and shared component styles
 ├── utils.go              # Terminal escape sanitization, UTF-8 width truncation, hex color validation, DST spans
 ├── ui_sidebar.go         # Left navigation sidebar with logo, view list, and focus indicator

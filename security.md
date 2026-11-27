@@ -164,6 +164,16 @@ This document records all security vulnerabilities and functional/layout bugs id
 - **Patch:** Enforced regular-file checks before and on the opened fd (`Mode().IsRegular()`) plus `ctx` cancellation; added `ParseCrontabWithWarnings` + `WarningProvider` surfaced in footer/Settings; restricted schedule timezone shifts to `CRON_TZ` only; split cron `%` stdin / unescaped `\%`; added `maxCrontabJobs` (`2000`) and `O(visible)` Settings row rendering; moved `p.Name()` into `loadSingleProviderSafe`, enforced `item.Source = name` unconditionally, loaded providers concurrently via `sync.WaitGroup`, and preserved last-known jobs on full reload error.
 - **Regression Tests:** `TestParseCrontabMacrosEnvTZAndSanitization`, `TestCronProviderFileSecurityAndErrors`, `TestCronProviderRejectsFIFOWithoutBlocking`, `TestLoadProvidersDedupeIsolationAndBubbleTeaRefresh` (`provider_cron_test.go`, `provider_cron_unix_test.go`).
 
+### SEC-17: Zero-Alloc Cron Bucketing, Hard Provider Deadlines, Non-Blocking Open, Step Overflow & Partial Reload Merge (Phase 2 Hardening)
+- **Severity:** High / Medium
+- **Affected Files:** `types.go`, `providers.go`, `provider_cron.go`, `provider_cron_unix.go`, `provider_cron_other.go`, `main.go`
+- **Root Cause:**
+  1. Rendering 2,000 `* * * * *` jobs on a 42-day Agenda materialized `60,480` timestamps per job (`OccurrencesInRange`), causing severe render-time memory/CPU DoS.
+  2. `LoadProviders` waited on `wg.Wait()` even if a provider ignored `ctx`; `readCrontabFile` had an `os.Stat` -> `os.Open` FIFO-swap TOCTOU window; `readSystemCrontab` panicked on `nil` `ctx`.
+  3. `parseCronField` allowed `int64` step overflow on huge values (e.g., `2/9223372036854775807`), malformed 1 MiB crontabs could allocate ~500k warning strings, and partial multi-source reload errors dropped last-known jobs from failed sources.
+- **Patch:** Added zero-allocation `HasOccurrenceInRange` fast path backed by bitmask `cronSchedule.hasOccurrenceIn` (`math/bits`), added `select` timeout isolation per provider in `LoadProviders`, opened files via `O_RDONLY|O_CLOEXEC|O_NONBLOCK` + fd `f.Stat` on Unix (`provider_cron_unix.go`), normalized `nil` `ctx`, bounded cron step values and loop increments against overflow, capped stored warnings at `maxCrontabWarnings` (`20`) with a suppression summary, and added per-source `mergeReloadJobs`.
+- **Regression Tests:** `TestHardeningTimeoutWarningCapNilCtxAndDense2000Render`, `TestCronProviderFIFOSwapTOCTOUNeverBlocks` (`provider_cron_test.go`, `provider_cron_unix_test.go`).
+
 ---
 
 ## 3. Verification Gate

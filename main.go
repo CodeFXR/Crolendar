@@ -95,16 +95,24 @@ func loadProvidersCmd(ctx context.Context, providers []JobProvider, gen uint64) 
 	}
 }
 
-func allProvidersErrored(statuses []ProviderStatus) bool {
-	if len(statuses) == 0 {
-		return false
-	}
-	for _, st := range statuses {
-		if st.Err == nil {
-			return false
+func mergeReloadJobs(prev []JobItem, res ProviderLoadResult) []JobItem {
+	failedSources := make(map[string]bool)
+	for _, st := range res.Statuses {
+		if st.Err != nil && st.Name != "" {
+			failedSources[st.Name] = true
 		}
 	}
-	return true
+	if len(failedSources) == 0 || len(prev) == 0 {
+		return res.Jobs
+	}
+	merged := make([]JobItem, 0, len(res.Jobs)+len(prev))
+	merged = append(merged, res.Jobs...)
+	for _, j := range prev {
+		if failedSources[j.Source] {
+			merged = append(merged, j)
+		}
+	}
+	return merged
 }
 
 func (m model) effectiveJob(j JobItem) JobItem {
@@ -285,10 +293,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = false
 		m.providerStatuses = msg.result.Statuses
-		// Preserve last-known jobs if a manual refresh fails across all providers.
-		if !(len(m.jobs) > 0 && len(msg.result.Jobs) == 0 && allProvidersErrored(msg.result.Statuses)) {
-			m.jobs = msg.result.Jobs
-		}
+		// Preserve last-known jobs per failed provider source while applying fresh jobs from healthy providers.
+		m.jobs = mergeReloadJobs(m.jobs, msg.result)
 		if len(m.jobs) == 0 {
 			m.settingsCursor = 0
 		} else {

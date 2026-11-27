@@ -37,9 +37,10 @@ type singleProviderOutcome struct {
 	err      error
 }
 
-// LoadProviders loads jobs from all providers concurrently under ctx (each bounded
-// by defaultProviderTimeout), recovers panics in Name() and Load(), enforces strict
-// Source namespacing and (Source, ID) uniqueness, and merges in deterministic order.
+// LoadProviders loads jobs from all providers concurrently under ctx, enforces a
+// hard per-provider deadline even if a provider ignores ctx, recovers panics in
+// Name() and Load(), enforces strict Source namespacing and (Source, ID) uniqueness,
+// and merges results in deterministic provider order.
 func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadResult {
 	res := ProviderLoadResult{
 		Statuses: make([]ProviderStatus, 0, len(providers)),
@@ -69,7 +70,21 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 			defer wg.Done()
 			pCtx, cancel := context.WithTimeout(ctx, defaultProviderTimeout)
 			defer cancel()
-			outcomes[idx] = loadSingleProviderSafe(pCtx, prov)
+
+			ch := make(chan singleProviderOutcome, 1)
+			go func() {
+				ch <- loadSingleProviderSafe(pCtx, prov)
+			}()
+
+			select {
+			case out := <-ch:
+				outcomes[idx] = out
+			case <-pCtx.Done():
+				outcomes[idx] = singleProviderOutcome{
+					name: safeProviderName(prov),
+					err:  fmt.Errorf("provider timed out: %w", pCtx.Err()),
+				}
+			}
 		}(i, p)
 	}
 	wg.Wait()
@@ -114,6 +129,19 @@ func LoadProviders(ctx context.Context, providers []JobProvider) ProviderLoadRes
 		})
 	}
 	return res
+}
+
+func safeProviderName(p JobProvider) (name string) {
+	name = "provider"
+	defer func() {
+		if recover() != nil {
+			name = "provider"
+		}
+	}()
+	if n := sanitizeText(p.Name()); n != "" {
+		return n
+	}
+	return "provider"
 }
 
 func loadSingleProviderSafe(ctx context.Context, p JobProvider) (out singleProviderOutcome) {
