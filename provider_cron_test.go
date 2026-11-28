@@ -498,7 +498,8 @@ func TestHardeningTimeoutWarningCapNilCtxAndDense2000Render(t *testing.T) {
 	// Also test readSystemCrontab(nil) does not panic even if crontab binary missing/empty.
 	_, _ = readSystemCrontab(nilCtx)
 
-	// 4. Dense 2,000 * * * * * jobs over 42-day Agenda and 7-day Week must finish fast with HasOccurrenceInRange.
+	// 4. Dense 2,000 * * * * * jobs over 42-day Agenda and 7-day Week must use the
+	// zero-allocation HasOccurrenceInRange fast path cleanly without wall-clock flakiness.
 	var dense strings.Builder
 	for i := 0; i < maxCrontabJobs; i++ {
 		dense.WriteString("* * * * * /bin/true\n")
@@ -507,15 +508,126 @@ func TestHardeningTimeoutWarningCapNilCtxAndDense2000Render(t *testing.T) {
 	if len(denseJobs) != maxCrontabJobs {
 		t.Fatalf("expected %d dense jobs, got %d", maxCrontabJobs, len(denseJobs))
 	}
-	t0 := time.Now()
+	if denseJobs[0].HasOccurrenceInRange == nil {
+		t.Fatalf("expected parsed cron job to wire HasOccurrenceInRange fast path")
+	}
 	dStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	dGrid := indexDayJobs(denseJobs, dStart, 42)
 	wGrid := indexWeekJobs(denseJobs, dStart)
 	if len(dGrid[41]) != maxCrontabJobs || len(wGrid[6][23]) != maxCrontabJobs {
 		t.Fatalf("expected all %d dense jobs indexed on day 42 and week day 6 h23", maxCrontabJobs)
 	}
-	if elapsed := time.Since(t0); elapsed > 2*time.Second {
-		t.Fatalf("dense 2000-job Agenda+Week indexing too slow: %v", elapsed)
+	everyMinSched, err := parseCronExpression("* * * * *")
+	if err != nil {
+		t.Fatalf("parse * * * * * failed: %v", err)
+	}
+	dEnd := dStart.Add(24 * time.Hour)
+	if allocs := testing.AllocsPerRun(20, func() {
+		if !everyMinSched.hasOccurrenceIn(dStart, dEnd, time.UTC) {
+			t.Fatal("expected match")
+		}
+	}); allocs != 0 {
+		t.Fatalf("expected hasOccurrenceIn fast path to perform 0 allocations, got %v", allocs)
+	}
+}
+
+func BenchmarkDense2000AgendaAndWeek(b *testing.B) {
+	var dense strings.Builder
+	for i := 0; i < maxCrontabJobs; i++ {
+		dense.WriteString("* * * * * /bin/true\n")
+	}
+	denseJobs := ParseCrontab(dense.String())
+	dStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = indexDayJobs(denseJobs, dStart, 42)
+		_ = indexWeekJobs(denseJobs, dStart)
+	}
+}
+
+func TestCronHasOccurrenceInMatchesOccurrences(t *testing.T) {
+	exprs := []string{
+		"* * * * *",
+		"0 0 * * *",
+		"30 1 * * *",
+		"30 2 * * *",
+		"15 2 * * *",
+		"45 1 * * *",
+		"0 0 13 * 5",
+		"0 0 */2 * 5",
+		"5/20 9-17 * * MON-FRI",
+		"0 0 29 2 *",
+	}
+	zoneNames := []string{
+		"UTC",
+		"America/Denver",
+		"America/New_York",
+		"Australia/Lord_Howe",
+		"Pacific/Kiritimati",
+	}
+	anchors := [][3]int{
+		{2026, 1, 15},
+		{2026, 3, 8},  // US spring-forward
+		{2026, 4, 5},  // Lord Howe fall-back (30m)
+		{2026, 10, 4}, // Lord Howe spring-forward (30m)
+		{2026, 11, 1}, // US fall-back (1h)
+		{2026, 12, 31},
+		{2028, 2, 29}, // leap day
+	}
+	offsets := []time.Duration{
+		0,
+		30 * time.Minute,
+		1 * time.Hour,
+		90 * time.Minute,
+		2 * time.Hour,
+		2*time.Hour + 15*time.Minute,
+		9*time.Hour + 5*time.Minute,
+		23*time.Hour + 30*time.Minute,
+	}
+	spans := []time.Duration{
+		0,
+		1 * time.Minute,
+		15 * time.Minute,
+		30 * time.Minute,
+		1 * time.Hour,
+		2 * time.Hour,
+		24 * time.Hour,
+		25 * time.Hour,
+		42 * 24 * time.Hour,
+	}
+
+	var locs []*time.Location
+	for _, z := range zoneNames {
+		if loc, err := time.LoadLocation(z); err == nil {
+			locs = append(locs, loc)
+		}
+	}
+
+	for _, expr := range exprs {
+		sched, err := parseCronExpression(expr)
+		if err != nil {
+			t.Fatalf("parse %q failed: %v", expr, err)
+		}
+		for _, loc := range locs {
+			for _, a := range anchors {
+				base := time.Date(a[0], time.Month(a[1]), a[2], 0, 0, 0, 0, loc)
+				for _, off := range offsets {
+					start := base.Add(off)
+					for _, sp := range spans {
+						if expr == "* * * * *" && sp > 25*time.Hour && off != 0 {
+							continue
+						}
+						end := start.Add(sp)
+						want := len(sched.occurrences(start, end, loc)) > 0
+						got := sched.hasOccurrenceIn(start, end, loc)
+						if got != want {
+							t.Fatalf("mismatch expr=%q loc=%s range=[%v, %v): hasOccurrenceIn=%v want=%v",
+								expr, loc, start, end, got, want)
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
