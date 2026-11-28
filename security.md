@@ -192,6 +192,15 @@ This document records all security vulnerabilities and functional/layout bugs id
   - Cleared `s.busy.Store(false)` strictly before sending the completed outcome on `ch` (`providers.go`).
 - **Regression Tests:** `TestCronOccurrencesDSTSpringForwardFallBackAndBounds` (explicit earlier-fold UTC offset + fold-window assertions for `America/Denver` and `Australia/Lord_Howe`), `TestProviderLoaderHardeningBlockingNameNoAccumulationAndWarningCap` (`provider_cron_test.go`).
 
+### SEC-20: XDG Config Persistence Hardening (2026-11-28)
+- **Risk:** Persisting job overrides to disk introduces symlink clobbering, FIFO/device open hangs, world-writable config tampering, relative `XDG_CONFIG_HOME` path confusion, out-of-order async save races, and accidental clobbering of a corrupt `config.json` on startup.
+- **Fix:**
+  - Implemented `ResolveConfigPath`, `LoadConfig`, `SaveConfig`, and `ConfigStore` (`config.go`, `config_unix.go`, `config_other.go`) storing sorted `(Source, ID)` overrides in versioned JSON (`version: 1`) at `$XDG_CONFIG_HOME/crolendar/config.json` (ignoring relative or control-char `XDG_CONFIG_HOME` per XDG spec; `--demo` remains in-memory unless `--config` is explicitly provided).
+  - Enforced `O_DIRECTORY|O_NOFOLLOW` parent checks, `O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW` read opens, fd `IsRegular()` + non-world-writable (`mode&0002 == 0`) checks, `1 MiB` byte cap, `5000` override cap, `20` warning cap, and full `sanitizeText` / `normalizeHexColor` / 48-rune alias validation.
+  - Enforced atomic `0700` dir / `0600` random `O_CREAT|O_EXCL|O_NOFOLLOW` temp file + `Sync()` + `Rename()` + parent dir `Sync()` writes, serialized via `ConfigStore.SaveSerialized` with monotonic generation guards and `Wait()` on shutdown.
+  - Guarded startup load failures (`configLoadFailed`): corrupt or rejected config files surface errors in Settings and footer and are never overwritten by in-session edits.
+- **Regression Tests:** `TestResolveConfigPathXDGAndValidation`, `TestConfigSaveLoadRoundTripAndSanitization`, `TestBubbleTeaSettingsPersistenceCorruptGuardAndReload`, `TestConfigUnixPermissionsSymlinkFIFOAndWorldWritableGuards` (`config_test.go`, `config_unix_test.go`).
+
 ---
 
 ## 3. Verification Gate

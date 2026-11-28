@@ -23,6 +23,11 @@ type providersLoadedMsg struct {
 	result ProviderLoadResult
 }
 
+type configSavedMsg struct {
+	gen uint64
+	err error
+}
+
 type model struct {
 	state                sessionState
 	width, height        int
@@ -40,6 +45,11 @@ type model struct {
 	appCancel            context.CancelFunc
 	loading              bool
 	loadGen              uint64
+	configStore          *ConfigStore
+	configLoadFailed     bool
+	configErr            string
+	configWarnings       []string
+	saveGen              uint64
 	overrides            map[JobKey]JobOverride
 	input                textinput.Model
 	settingsState        int // 0: List, 1: EditAlias, 2: EditColor
@@ -95,6 +105,39 @@ func loadProvidersCmd(ctx context.Context, loader *ProviderLoader, gen uint64) t
 		return providersLoadedMsg{
 			gen:    gen,
 			result: loader.Load(ctx),
+		}
+	}
+}
+
+func saveConfigCmd(store *ConfigStore, gen uint64, overrides map[JobKey]JobOverride) tea.Cmd {
+	return func() tea.Msg {
+		return configSavedMsg{
+			gen: gen,
+			err: store.SaveSerialized(gen, overrides),
+		}
+	}
+}
+
+func (m *model) attachConfigStore(store *ConfigStore) {
+	if store == nil {
+		return
+	}
+	m.configStore = store
+	overrides, warnings, err := store.Load()
+	if err != nil {
+		m.configLoadFailed = true
+		m.configErr = sanitizeText(err.Error())
+		return
+	}
+	m.configLoadFailed = false
+	m.configErr = ""
+	m.configWarnings = warnings
+	if len(overrides) > 0 {
+		if m.overrides == nil {
+			m.overrides = make(map[JobKey]JobOverride, len(overrides))
+		}
+		for k, v := range overrides {
+			m.overrides[k] = v
 		}
 	}
 }
@@ -329,6 +372,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = updateViewContent(m)
 		return m, nil
 
+	case configSavedMsg:
+		if msg.gen < m.saveGen {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.configErr = sanitizeText(msg.err.Error())
+			m.settingsError = "Save failed: " + m.configErr
+			m.settingsNotice = ""
+		} else {
+			m.configErr = ""
+			m.settingsError = ""
+			if m.state == viewSettings {
+				m.settingsNotice = "Saved settings"
+			}
+		}
+		return m, nil
+
 	case time.Time:
 		m = updateViewContent(m)
 		return m, tea.Tick(time.Minute, func(t time.Time) tea.Msg { return t })
@@ -491,9 +551,18 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.settingsInitialAlias = ""
 			m.settingsDraftAlias = ""
 			m.settingsError = ""
-			m.settingsNotice = "Updated in-memory settings"
 			m.settingsState = 0
 			m.input.Blur()
+			if m.configStore != nil && !m.configLoadFailed {
+				m.saveGen++
+				m.settingsNotice = "Saving settings..."
+				return m, saveConfigCmd(m.configStore, m.saveGen, cloneOverrides(m.overrides))
+			}
+			if m.configStore != nil && m.configLoadFailed {
+				m.settingsNotice = "Updated in-memory only (fix config error first)"
+				return m, nil
+			}
+			m.settingsNotice = "Updated in-memory settings"
 			return m, nil
 		}
 	}
@@ -675,6 +744,10 @@ func (m model) renderFooter() string {
 				break
 			}
 		}
+		if !statusIsErr && m.configErr != "" {
+			statusNote = "config error: " + m.configErr
+			statusIsErr = true
+		}
 		if !statusIsErr {
 			for _, st := range m.providerStatuses {
 				if len(st.Warnings) > 0 {
@@ -683,6 +756,10 @@ func (m model) renderFooter() string {
 					break
 				}
 			}
+		}
+		if !statusIsErr && !statusIsWarn && len(m.configWarnings) > 0 {
+			statusNote = fmt.Sprintf("config: %d warning(s) (%s)", len(m.configWarnings), sanitizeText(m.configWarnings[0]))
+			statusIsWarn = true
 		}
 	}
 
@@ -757,6 +834,7 @@ func (m model) View() string {
 func main() {
 	demo := flag.Bool("demo", false, "Populate UI with sample scheduled jobs")
 	crontabPath := flag.String("crontab", "", "Read user-format crontab file path (5 fields, read-only; not /etc/crontab)")
+	configPath := flag.String("config", "", "Path to config JSON file (default: $XDG_CONFIG_HOME/crolendar/config.json)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -774,6 +852,32 @@ func main() {
 	} else {
 		providers := []JobProvider{NewCronProvider(*crontabPath)}
 		m = newModelWithContext(appCtx, nil, providers)
+	}
+
+	explicitConfig := strings.TrimSpace(*configPath) != ""
+	if !*demo || explicitConfig {
+		resolvedPath, err := ResolveConfigPath(*configPath)
+		if err != nil {
+			if explicitConfig {
+				fmt.Fprintf(os.Stderr, "crolendar config error: %v\n", err)
+				os.Exit(1)
+			}
+			m.configLoadFailed = true
+			m.configErr = sanitizeText(err.Error())
+		} else {
+			store, err := NewConfigStore(resolvedPath)
+			if err != nil {
+				if explicitConfig {
+					fmt.Fprintf(os.Stderr, "crolendar config error: %v\n", err)
+					os.Exit(1)
+				}
+				m.configLoadFailed = true
+				m.configErr = sanitizeText(err.Error())
+			} else {
+				defer store.Wait()
+				m.attachConfigStore(store)
+			}
+		}
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

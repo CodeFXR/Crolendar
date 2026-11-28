@@ -38,6 +38,15 @@ func renderSettingsView(m model, availWidth, bodyHeight int) string {
 					emptyLines = append(emptyLines, warnTextStyle.Render(truncateWidth(msg, availWidth-6)))
 				}
 			}
+			if m.configErr != "" {
+				hasErrOrWarn = true
+				msg := fmt.Sprintf("config: %s", sanitizeText(m.configErr))
+				emptyLines = append(emptyLines, errorTextStyle.Render(truncateWidth(msg, availWidth-6)))
+			} else if len(m.configWarnings) > 0 {
+				hasErrOrWarn = true
+				msg := fmt.Sprintf("config: %d warning(s) (%s)", len(m.configWarnings), sanitizeText(m.configWarnings[0]))
+				emptyLines = append(emptyLines, warnTextStyle.Render(truncateWidth(msg, availWidth-6)))
+			}
 			if !hasErrOrWarn {
 				emptyLines = append(emptyLines,
 					mutedTextStyle.Render(truncateWidth("No scheduled entries were returned by active providers.", availWidth-6)),
@@ -73,6 +82,10 @@ func renderSettingsView(m model, availWidth, bodyHeight int) string {
 			break
 		}
 	}
+	if statusBanner == "" && m.configErr != "" {
+		msg := fmt.Sprintf("config error: %s", sanitizeText(m.configErr))
+		statusBanner = errorTextStyle.PaddingLeft(2).Render(truncateWidth(msg, maxLineWidth))
+	}
 	if statusBanner == "" {
 		for _, st := range m.providerStatuses {
 			if len(st.Warnings) > 0 {
@@ -81,6 +94,10 @@ func renderSettingsView(m model, availWidth, bodyHeight int) string {
 				break
 			}
 		}
+	}
+	if statusBanner == "" && len(m.configWarnings) > 0 {
+		msg := fmt.Sprintf("config: %d warning(s) (%s)", len(m.configWarnings), sanitizeText(m.configWarnings[0]))
+		statusBanner = warnTextStyle.PaddingLeft(2).Render(truncateWidth(msg, maxLineWidth))
 	}
 
 	renderJobRow := func(i int, isSelected bool) []string {

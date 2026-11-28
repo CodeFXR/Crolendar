@@ -10,8 +10,13 @@ For security defects found and patched in this codebase, see `security.md`.
 
 ```text
 crolendar/
-├── main.go               # Bubble Tea MVU entrypoint, async provider reload, flags (--demo, --crontab, --version)
+├── main.go               # Bubble Tea MVU entrypoint, async provider reload & config save, flags (--demo, --crontab, --config, --version)
 ├── types.go              # Provider-agnostic JobItem model, JobProvider contract, view state, day/hour indexers
+├── config.go             # XDG config path resolution, JSON schema v1 load/save, ConfigStore serialization
+├── config_unix.go        # Unix O_NOFOLLOW/O_NONBLOCK config open, 0700/0600 atomic temp+fsync+rename write
+├── config_other.go       # Non-Unix config open and atomic write helpers for cross-platform builds
+├── config_test.go        # XDG resolution, round-trip, sanitization, corrupt-guard, and Bubble Tea save tests
+├── config_unix_test.go   # Unix 0700/0600 permission, symlink, FIFO, and world-writable rejection tests
 ├── providers.go          # Provider aggregator (timeouts, panic recovery, Source namespacing, key deduplication)
 ├── provider_cron.go           # Read-only POSIX/Vixie cron parser (crontab -l or --crontab <path>, CRON_TZ, macros)
 ├── provider_cron_unix.go      # Unix O_NONBLOCK regular-file open helper preventing FIFO TOCTOU hangs
@@ -44,7 +49,7 @@ crolendar/
 - `newModelWithProviders(jobs []JobItem, providers []JobProvider)` initializes the Bubble Tea `model` with `viewAgenda`, `time.Now()` cursor, inline `textinput.Model`, and async `LoadProviders` commands tracked by a generation counter (`loadGen`) to discard stale refreshes.
 - `layoutDimensions()` reserves 2 lines for the bottom status/keybinding footer and `sidebarFullWidth` (`21` columns: 20 content + 1 border) for the left sidebar.
 - Terminals smaller than `44x14` (`minTermWidth x minTermHeight`) render a centered resize notice instead of clipping or panicking.
-- `main()` supports `--crontab <path>` (read-only crontab file), `--demo` (in-memory sample fixtures), and `--version` (`crolendar <version>`). By default `./crolendar` loads the current user's crontab via `CronProvider` (`crontab -l`) in read-only mode.
+- `main()` supports `--crontab <path>` (read-only crontab file), `--config <path>` (override XDG config JSON path), `--demo` (in-memory sample fixtures; skips disk config unless `--config` is explicitly provided), and `--version` (`crolendar <version>`). By default `./crolendar` loads the current user's crontab via `CronProvider` (`crontab -l`) in read-only mode and persists job display overrides (Alias, Color) under `$XDG_CONFIG_HOME/crolendar/config.json` (fallback: `os.UserConfigDir()/crolendar/config.json`).
 
 ### 2.2 Provider-Agnostic View Model (`types.go`)
 All UI views consume `JobItem` and `JobProvider` rather than cron-specific structs:
@@ -111,9 +116,9 @@ go build -o crolendar .
   3. **Kubernetes CronJobs (Planned):** Read-only cluster/context CronJob schedule visualization (`kubectl` or `client-go`) with namespace filtering.
 - Remaining Phase 2 UI: source-filter toggles and per-provider status summary.
 
-### Phase 3: Persistence, Job Management & Inspection
-- Add XDG-compliant config persistence (`$XDG_CONFIG_HOME/crolendar/config.json`) using atomic temp-file writes and strict symlink/permission checks for job aliases, colors, and enabled providers.
-- Add safe CRUD workflows where supported by the source provider, execution log inspection, manual trigger with explicit confirmation, and same-hour overlap/conflict highlighting.
+### Phase 3: Persistence, Job Management & Inspection (In Progress)
+- Implemented XDG-compliant config persistence (`config.go`, `config_unix.go`, `config_other.go`) at `$XDG_CONFIG_HOME/crolendar/config.json` (ignoring relative/invalid `XDG_CONFIG_HOME` per XDG spec) using versioned JSON v1, `1 MiB` / `5000` entry caps, ANSI/bidi/hex sanitization, `O_NOFOLLOW|O_NONBLOCK` regular-file reads, `0700` dir / `0600` atomic `O_CREAT|O_EXCL` temp-file + `fsync` + `rename` writes, serialized `ConfigStore` generations, and corrupt-file overwrite protection.
+- Remaining Phase 3: safe CRUD workflows where supported by the source provider, execution log inspection, manual trigger with explicit confirmation, and same-hour overlap/conflict highlighting.
 
 ### Phase 4: Packaging & Release Readiness
 - Set up CI gates (`gofmt`, `go vet`, `go test -race`, `govulncheck`).
