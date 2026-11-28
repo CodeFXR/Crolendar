@@ -201,6 +201,14 @@ This document records all security vulnerabilities and functional/layout bugs id
   - Guarded startup load failures (`configLoadFailed`): corrupt or rejected config files surface errors in Settings and footer and are never overwritten by in-session edits.
 - **Regression Tests:** `TestResolveConfigPathXDGAndValidation`, `TestConfigSaveLoadRoundTripAndSanitization`, `TestBubbleTeaSettingsPersistenceCorruptGuardAndReload`, `TestConfigUnixPermissionsSymlinkFIFOAndWorldWritableGuards` (`config_test.go`, `config_unix_test.go`).
 
+### SEC-21: DirFD-Relative Atomic Config I/O, Synchronous Enqueue/Flush Durability & Streaming JSON Cap (2026-11-28)
+- **Risk:** (1) Registering `WaitGroup.Add` inside the Bubble Tea `tea.Cmd` goroutine raced with `Wait()` on immediate quit (risking lost edits or `sync: WaitGroup misuse`), and `os.Exit(1)` on `p.Run()` error skipped deferred cleanup; (2) closing `dirFD` and reopening/renaming by pathname left a parent-directory symlink-swap TOCTOU window, and group-writable or foreign-owned files/directories were not rejected; (3) `json.Unmarshal` materialized all entries before capping at `5000`, accepted missing/zero `version`, rejected UTF-8 BOM, silently truncated `>5000` overrides on save, and display-sanitized persisted `JobKey` components.
+- **Fix:**
+  - Replaced `WaitGroup` in `ConfigStore` (`config.go`) with two-mutex synchronous `Enqueue` (called in `Update()` before returning `saveConfigCmd`) + serialized `Flush`/`CloseAndFlush`; refactored `main()` into `run() int` (`main.go`) so `defer configStore.CloseAndFlush()` executes unconditionally even on `p.Run()` errors or immediate quit before `tea.Cmd` starts.
+  - Migrated `config_unix.go` to held `dirFD`-relative `unix.Openat`, `unix.Fstatat`, `unix.Renameat`, `unix.Unlinkat`, `unix.Fchmod`, and `unix.Fsync` (checking `dirFD` fsync errors except unsupported-FS codes), rejecting group/world-writable (`mode&0o022 != 0`) or non-owner (`Uid != euid`) directories and files; migrated `config_other.go` to Go 1.25 `os.OpenRoot` directory anchoring.
+  - Replaced full-slice `json.Unmarshal` with streaming `decodeConfigJSON` + O(depth) `skipJSONValue`, stripping UTF-8 BOM, strictly requiring `version == 1`, rejecting trailing data, rejecting `>5000` overrides on save with an error, validating persisted `Source`/`ID` byte-for-byte via `validateJobKeyComponent`, clearing `configWarnings` after a clean save, and failing fast on explicit `--config` load errors.
+- **Regression Tests:** Updated `TestConfigSaveLoadRoundTripAndSanitization`, `TestBubbleTeaSettingsPersistenceCorruptGuardAndReload` (including quit-before-cmd-starts `CloseAndFlush`), and `TestConfigUnixPermissionsSymlinkFIFOAndWorldWritableGuards` (`config_test.go`, `config_unix_test.go`).
+
 ---
 
 ## 3. Verification Gate

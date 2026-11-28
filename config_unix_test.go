@@ -43,12 +43,44 @@ func TestConfigUnixPermissionsSymlinkFIFOAndWorldWritableGuards(t *testing.T) {
 		t.Fatalf("expected only config.json with no leftover temp files, got %v", entries)
 	}
 
-	// 2. Reject world-writable config file on load.
+	// 2. Reject group-writable (0620) and world-writable (0666) config files on load.
+	if err := os.Chmod(cfgPath, 0o620); err != nil {
+		t.Fatalf("chmod 0620 failed: %v", err)
+	}
+	if _, _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected group-writable config file to be rejected, got %v", err)
+	}
 	if err := os.Chmod(cfgPath, 0o666); err != nil {
 		t.Fatalf("chmod 0666 failed: %v", err)
 	}
-	if _, _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "world-writable") {
+	if _, _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "writable") {
 		t.Fatalf("expected world-writable config file to be rejected, got %v", err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatalf("restore 0600 failed: %v", err)
+	}
+
+	// 2b. Reject group-writable (0720) and world-writable (0777) config directories on both load and save.
+	if err := os.Chmod(cfgDir, 0o720); err != nil {
+		t.Fatalf("chmod dir 0720 failed: %v", err)
+	}
+	if _, _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected group-writable config dir to be rejected on load, got %v", err)
+	}
+	if err := SaveConfig(cfgPath, map[JobKey]JobOverride{}); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected group-writable config dir to be rejected on save, got %v", err)
+	}
+	if err := os.Chmod(cfgDir, 0o777); err != nil {
+		t.Fatalf("chmod dir 0777 failed: %v", err)
+	}
+	if _, _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected world-writable config dir to be rejected on load, got %v", err)
+	}
+	if err := SaveConfig(cfgPath, map[JobKey]JobOverride{}); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("expected world-writable config dir to be rejected on save, got %v", err)
+	}
+	if err := os.Chmod(cfgDir, 0o700); err != nil {
+		t.Fatalf("restore dir 0700 failed: %v", err)
 	}
 
 	// 3. Reject symlinked config file on both load and save without touching target.

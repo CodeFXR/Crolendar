@@ -11,6 +11,8 @@ import (
 
 func openConfigFileReadOnly(path string) (*os.File, error) {
 	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
 	dirInfo, err := os.Lstat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -22,7 +24,16 @@ func openConfigFileReadOnly(path string) (*os.File, error) {
 		return nil, errors.New("refusing symlinked or non-directory config parent")
 	}
 
-	linfo, err := os.Lstat(path)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("cannot open config directory root: %w", err)
+	}
+	defer root.Close()
+
+	linfo, err := root.Lstat(base)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, os.ErrNotExist
@@ -33,7 +44,7 @@ func openConfigFileReadOnly(path string) (*os.File, error) {
 		return nil, errors.New("config path must be a regular file")
 	}
 
-	f, err := os.Open(path)
+	f, err := root.Open(base)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open config file: %w", err)
 	}
@@ -55,6 +66,8 @@ func openConfigFileReadOnly(path string) (*os.File, error) {
 
 func writeConfigFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
 	if info, err := os.Lstat(dir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("cannot inspect config directory: %w", err)
@@ -66,7 +79,13 @@ func writeConfigFileAtomic(path string, data []byte) error {
 		return errors.New("refusing symlinked or non-directory config parent")
 	}
 
-	if info, err := os.Lstat(path); err == nil {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("cannot open config directory root: %w", err)
+	}
+	defer root.Close()
+
+	if info, err := root.Lstat(base); err == nil {
 		if !info.Mode().IsRegular() {
 			return errors.New("refusing to overwrite symlink or non-regular config file")
 		}
@@ -78,9 +97,9 @@ func writeConfigFileAtomic(path string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("cannot generate temp filename: %w", err)
 	}
-	tmpPath := filepath.Join(dir, fmt.Sprintf(".%s.tmp.%s", filepath.Base(path), suffix))
+	tmpName := fmt.Sprintf(".%s.tmp.%s", base, suffix)
 
-	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	tmpFile, err := root.OpenFile(tmpName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("cannot create temp config file: %w", err)
 	}
@@ -88,7 +107,7 @@ func writeConfigFileAtomic(path string, data []byte) error {
 	renamed := false
 	defer func() {
 		if !renamed {
-			_ = os.Remove(tmpPath)
+			_ = root.Remove(tmpName)
 		}
 	}()
 
@@ -104,7 +123,15 @@ func writeConfigFileAtomic(path string, data []byte) error {
 		return fmt.Errorf("cannot close temp config file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, path); err != nil {
+	if info, err := root.Lstat(base); err == nil {
+		if !info.Mode().IsRegular() {
+			return errors.New("refusing to overwrite symlink or non-regular config file")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cannot inspect target config file: %w", err)
+	}
+
+	if err := root.Rename(tmpName, base); err != nil {
 		return fmt.Errorf("cannot atomically replace config file: %w", err)
 	}
 	renamed = true

@@ -133,14 +133,17 @@ func TestConfigSaveLoadRoundTripAndSanitization(t *testing.T) {
 		t.Fatalf("expected hand-edited alias with normalized #AABBCC, got %+v", j2)
 	}
 
-	// Reject malformed JSON, root null, root array, unsupported version, and >1 MiB file.
+	// Reject malformed JSON, root null, root array, missing/zero/unsupported version, trailing garbage, and >1 MiB file.
 	for name, content := range map[string]string{
-		"corrupt.json":    `{"version": 1, "overrides": [`,
-		"null.json":       `null`,
-		"array.json":      `[]`,
-		"future_ver.json": `{"version": 99, "overrides": []}`,
-		"neg_ver.json":    `{"version": -1, "overrides": []}`,
-		"oversized.json":  strings.Repeat(" ", maxConfigBytes+10),
+		"corrupt.json":     `{"version": 1, "overrides": [`,
+		"null.json":        `null`,
+		"array.json":       `[]`,
+		"missing_ver.json": `{"overrides": []}`,
+		"zero_ver.json":    `{"version": 0, "overrides": []}`,
+		"future_ver.json":  `{"version": 99, "overrides": []}`,
+		"neg_ver.json":     `{"version": -1, "overrides": []}`,
+		"trailing.json":    `{"version": 1, "overrides": []} trailing`,
+		"oversized.json":   strings.Repeat(" ", maxConfigBytes+10),
 	} {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
@@ -149,6 +152,53 @@ func TestConfigSaveLoadRoundTripAndSanitization(t *testing.T) {
 		if _, _, err := LoadConfig(p); err == nil {
 			t.Fatalf("expected LoadConfig(%s) to fail", name)
 		}
+	}
+
+	// Accept UTF-8 BOM and arbitrary key order (overrides before version).
+	bomContent := "\xef\xbb\xbf" + `{"overrides":[{"source":"cron","id":"key  with spaces","alias":"BOM Job","color":"#123456"}],"version":1}`
+	bomPath := filepath.Join(dir, "bom.json")
+	if err := os.WriteFile(bomPath, []byte(bomContent), 0o600); err != nil {
+		t.Fatalf("write bom.json failed: %v", err)
+	}
+	bomParsed, bomWarns, err := LoadConfig(bomPath)
+	if err != nil || len(bomWarns) != 0 {
+		t.Fatalf("expected BOM + reversed-key JSON to load cleanly, got warns=%v err=%v", bomWarns, err)
+	}
+	if got := bomParsed[JobKey{Source: "cron", ID: "key  with spaces"}]; got.Alias != "BOM Job" || got.Color != "#123456" {
+		t.Fatalf("expected raw key with double spaces preserved byte-for-byte, got %+v", bomParsed)
+	}
+
+	// SaveConfig refuses > maxConfigOverrides without silent truncation.
+	tooManyExact := make(map[JobKey]JobOverride, maxConfigOverrides+1)
+	for i := 0; i <= maxConfigOverrides; i++ {
+		tooManyExact[JobKey{Source: "cron", ID: filepath.Join("id", strings.Repeat("a", i%3+1), string(rune(0x100+i)))}] = JobOverride{
+			Alias: "A", HasAlias: true, Color: "#111111",
+		}
+	}
+	if err := SaveConfig(filepath.Join(dir, "toomany.json"), tooManyExact); err == nil {
+		t.Fatalf("expected SaveConfig to reject > %d overrides", maxConfigOverrides)
+	}
+
+	// Streaming cap handles large empty-object arrays in bounded memory and still validates version.
+	var emptyObjs strings.Builder
+	emptyObjs.WriteString(`{"overrides":[`)
+	for i := 0; i < maxConfigOverrides+500; i++ {
+		if i > 0 {
+			emptyObjs.WriteByte(',')
+		}
+		emptyObjs.WriteString(`{}`)
+	}
+	emptyObjs.WriteString(`],"version":1}`)
+	ampPath := filepath.Join(dir, "amp.json")
+	if err := os.WriteFile(ampPath, []byte(emptyObjs.String()), 0o600); err != nil {
+		t.Fatalf("write amp.json failed: %v", err)
+	}
+	_, ampWarns, err := LoadConfig(ampPath)
+	if err != nil {
+		t.Fatalf("LoadConfig streaming-capped empty-object array failed: %v", err)
+	}
+	if len(ampWarns) != maxConfigWarnings+1 {
+		t.Fatalf("expected capped %d warnings on oversized empty-object array, got %d", maxConfigWarnings+1, len(ampWarns))
 	}
 
 	// Warning cap on 100 invalid entries.
@@ -213,8 +263,34 @@ func TestBubbleTeaSettingsPersistenceCorruptGuardAndReload(t *testing.T) {
 	savedMsg := saveCmd()
 	next, _ = m.Update(savedMsg)
 	m = next.(model)
-	if m.settingsError != "" || m.settingsNotice != "Saved settings" {
-		t.Fatalf("expected clean Saved settings notice, got err=%q notice=%q", m.settingsError, m.settingsNotice)
+	if m.settingsError != "" || m.settingsNotice != "Saved settings" || len(m.configWarnings) != 0 {
+		t.Fatalf("expected clean Saved settings notice and cleared warnings, got err=%q notice=%q warns=%v", m.settingsError, m.settingsNotice, m.configWarnings)
+	}
+
+	// 1b. Quit-before-cmd-starts durability: save in Settings, DO NOT execute saveCmd
+	// (simulating immediate quit before Bubble Tea starts the command goroutine), then
+	// CloseAndFlush() must synchronously persist the enqueued edit to disk.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	m.input.SetValue("Immediate Quit Save")
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	m.input.SetValue("#654321")
+	next, unrunCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	if unrunCmd == nil {
+		t.Fatalf("expected save cmd")
+	}
+	// Intentionally skip running unrunCmd; simulate process shutdown calling CloseAndFlush().
+	if err := store.CloseAndFlush(); err != nil {
+		t.Fatalf("CloseAndFlush failed: %v", err)
+	}
+	flushedData, _, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load after CloseAndFlush failed: %v", err)
+	}
+	if got := flushedData[JobKey{Source: "cron", ID: "cron-job1"}]; got.Alias != "Immediate Quit Save" || got.Color != "#654321" {
+		t.Fatalf("expected CloseAndFlush to persist unrun enqueued edit, got %+v", got)
 	}
 
 	// 2. Restart a brand-new model pointing at the same ConfigStore and reload provider:
@@ -230,7 +306,7 @@ func TestBubbleTeaSettingsPersistenceCorruptGuardAndReload(t *testing.T) {
 	m2 = next2.(model)
 
 	eff := m2.effectiveJob(m2.jobs[0])
-	if eff.DisplayName() != "Nightly Backup" || eff.DisplayColor() != "#12AB34" {
+	if eff.DisplayName() != "Immediate Quit Save" || eff.DisplayColor() != "#654321" {
 		t.Fatalf("expected persisted Alias/Color after restart+reload, got name=%q color=%q", eff.DisplayName(), eff.DisplayColor())
 	}
 
@@ -312,7 +388,9 @@ func TestBubbleTeaSettingsPersistenceCorruptGuardAndReload(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	raceStore.Wait()
+	if err := raceStore.CloseAndFlush(); err != nil {
+		t.Fatalf("CloseAndFlush after concurrent saves failed: %v", err)
+	}
 	if _, _, err := raceStore.Load(); err != nil {
 		t.Fatalf("concurrent saves left unreadable config: %v", err)
 	}

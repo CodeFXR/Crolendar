@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const (
@@ -21,6 +23,7 @@ const (
 	maxConfigOverrides   = 5000
 	maxConfigWarnings    = 20
 	maxAliasRunes        = 48
+	maxJobKeyBytes       = 256
 )
 
 type configFileData struct {
@@ -36,12 +39,22 @@ type configOverrideEntry struct {
 	Color    string `json:"color,omitempty"`
 }
 
-// ConfigStore serializes atomic reads and writes to Crolendar's XDG config file.
+// ConfigStore coordinates atomic, serialized reads and writes to Crolendar's
+// XDG config file. Enqueue is non-blocking for Bubble Tea Update(), while
+// Flush/CloseAndFlush guarantee durability even if the user quits immediately
+// after saving or Bubble Tea exits with an error.
 type ConfigStore struct {
-	path         string
-	mu           sync.Mutex
-	wg           sync.WaitGroup
+	path string
+
+	ioMu sync.Mutex // serializes disk I/O
+	mu   sync.Mutex // guards pending/generation state below
+
+	hasPending   bool
+	pendingGen   uint64
+	pendingData  map[JobKey]JobOverride
 	lastSavedGen uint64
+	lastErrGen   uint64
+	lastErr      error
 }
 
 // NewConfigStore returns a ConfigStore bound to a validated config file path.
@@ -66,48 +79,100 @@ func (s *ConfigStore) Load() (map[JobKey]JobOverride, []string, error) {
 	if s == nil {
 		return make(map[JobKey]JobOverride), nil, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
 	return LoadConfig(s.path)
 }
 
-// Save atomically writes overrides to disk.
+// Save atomically writes overrides to disk synchronously.
 func (s *ConfigStore) Save(overrides map[JobKey]JobOverride) error {
 	if s == nil {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
 	return SaveConfig(s.path, overrides)
 }
 
-// SaveSerialized writes overrides only if gen is newer than any previously saved
-// generation, preventing out-of-order async saves from overwriting newer edits.
+// Enqueue records a newer override snapshot synchronously before an async
+// Bubble Tea command is dispatched. It never blocks on disk I/O.
+func (s *ConfigStore) Enqueue(gen uint64, overrides map[JobKey]JobOverride) {
+	if s == nil {
+		return
+	}
+	snap := cloneOverrides(overrides)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen <= s.lastSavedGen || (s.hasPending && gen < s.pendingGen) {
+		return
+	}
+	s.pendingGen = gen
+	s.pendingData = snap
+	s.hasPending = true
+}
+
+// Flush persists all enqueued overrides in order and returns the outcome for gen
+// (or the latest flushed error when gen == 0).
+func (s *ConfigStore) Flush(gen uint64) error {
+	if s == nil {
+		return nil
+	}
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+
+	var latestErr error
+	for {
+		s.mu.Lock()
+		if !s.hasPending {
+			var err error
+			if gen != 0 && s.lastErrGen == gen {
+				err = s.lastErr
+			} else if gen == 0 {
+				err = latestErr
+			}
+			s.mu.Unlock()
+			return err
+		}
+		curGen := s.pendingGen
+		curData := s.pendingData
+		s.hasPending = false
+		s.pendingData = nil
+		s.mu.Unlock()
+
+		err := SaveConfig(s.path, curData)
+
+		s.mu.Lock()
+		if err != nil {
+			s.lastErrGen = curGen
+			s.lastErr = err
+			latestErr = err
+		} else {
+			if curGen > s.lastSavedGen {
+				s.lastSavedGen = curGen
+			}
+			if s.lastErrGen <= curGen {
+				s.lastErr = nil
+				s.lastErrGen = 0
+			}
+			latestErr = nil
+		}
+		s.mu.Unlock()
+	}
+}
+
+// SaveSerialized enqueues and flushes overrides for gen. Stale generations are ignored.
 func (s *ConfigStore) SaveSerialized(gen uint64, overrides map[JobKey]JobOverride) error {
 	if s == nil {
 		return nil
 	}
-	s.wg.Add(1)
-	defer s.wg.Done()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen < s.lastSavedGen {
-		return nil
-	}
-	if err := SaveConfig(s.path, overrides); err != nil {
-		return err
-	}
-	s.lastSavedGen = gen
-	return nil
+	s.Enqueue(gen, overrides)
+	return s.Flush(gen)
 }
 
-// Wait blocks until any in-flight SaveSerialized call finishes.
-func (s *ConfigStore) Wait() {
-	if s == nil {
-		return
-	}
-	s.wg.Wait()
+// CloseAndFlush blocks until any in-flight save finishes and synchronously writes
+// any still-pending enqueued edit before process exit.
+func (s *ConfigStore) CloseAndFlush() error {
+	return s.Flush(0)
 }
 
 // ResolveConfigPath resolves the config file path using an explicit override or
@@ -148,6 +213,9 @@ func defaultUserConfigDirIgnoringXDG() (string, error) {
 }
 
 func hasUnsafePathRune(p string) bool {
+	if !utf8.ValidString(p) {
+		return true
+	}
 	for _, r := range p {
 		if r == 0 || r == '\r' || r == '\n' || isBlockedControlRune(r) {
 			return true
@@ -175,9 +243,25 @@ func validateConfigPath(raw string) (string, error) {
 	return clean, nil
 }
 
+// validateJobKeyComponent validates persisted Source/ID strings byte-for-byte
+// without mutating interior whitespace or punctuation that may distinguish raw
+// provider keys.
+func validateJobKeyComponent(s string) bool {
+	if s == "" || len(s) > maxJobKeyBytes || strings.TrimSpace(s) == "" || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r == 0 || r == '\r' || r == '\n' || r == '\t' || isBlockedControlRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // LoadConfig reads, validates, and sanitizes overrides from a config JSON file.
 // Missing files return an empty map and nil error. Symlinks, special files,
-// world-writable files, oversized files (>1 MiB), and unsupported versions fail safely.
+// group/world-writable or foreign-owned files/dirs, oversized files (>1 MiB),
+// and missing/unsupported versions fail safely.
 func LoadConfig(path string) (map[JobKey]JobOverride, []string, error) {
 	cleanPath, err := validateConfigPath(path)
 	if err != nil {
@@ -199,22 +283,28 @@ func LoadConfig(path string) (map[JobKey]JobOverride, []string, error) {
 	if len(data) > maxConfigBytes {
 		return nil, nil, fmt.Errorf("config file exceeds %d byte limit", maxConfigBytes)
 	}
-	trimmed := strings.TrimSpace(string(data))
-	if len(trimmed) == 0 {
+	// Strip optional UTF-8 BOM before checking/decoding JSON.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	if len(bytes.TrimSpace(data)) == 0 {
 		return make(map[JobKey]JobOverride), nil, nil
 	}
-	if trimmed[0] != '{' {
+
+	return decodeConfigJSON(data)
+}
+
+func decodeConfigJSON(data []byte) (map[JobKey]JobOverride, []string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
 		return nil, nil, errors.New("invalid config JSON: root must be a JSON object")
 	}
 
-	var parsed configFileData
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
-	}
-	if parsed.Version < 0 || parsed.Version > currentConfigVersion {
-		return nil, nil, fmt.Errorf("unsupported config version %d (supported: %d)", parsed.Version, currentConfigVersion)
-	}
-
+	hasVersion := false
+	versionVal := 0
 	overrides := make(map[JobKey]JobOverride)
 	var warnings []string
 	suppressed := 0
@@ -226,39 +316,106 @@ func LoadConfig(path string) (map[JobKey]JobOverride, []string, error) {
 		}
 	}
 
-	for idx, entry := range parsed.Overrides {
-		if len(overrides) >= maxConfigOverrides {
-			addWarn(fmt.Sprintf("config override cap (%d) reached; remaining entries ignored", maxConfigOverrides))
-			break
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
 		}
-		src := sanitizeText(entry.Source)
-		id := sanitizeText(entry.ID)
-		if src == "" || id == "" {
-			addWarn(fmt.Sprintf("config entry %d: missing source or id; skipped", idx+1))
-			continue
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, nil, errors.New("invalid config JSON: expected string object key")
 		}
 
-		alias := trimToRunes(sanitizeText(entry.Alias), maxAliasRunes)
-		hasAlias := entry.HasAlias || alias != ""
+		switch key {
+		case "version":
+			if err := dec.Decode(&versionVal); err != nil {
+				return nil, nil, fmt.Errorf("invalid config version field: %w", err)
+			}
+			hasVersion = true
 
-		color := ""
-		if strings.TrimSpace(entry.Color) != "" {
-			if norm, ok := normalizeHexColor(entry.Color); ok {
-				color = norm
-			} else {
-				addWarn(fmt.Sprintf("config entry %d (%s/%s): invalid hex color ignored", idx+1, src, id))
+		case "overrides":
+			arrTok, err := dec.Token()
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid config overrides field: %w", err)
+			}
+			if arrTok == nil {
+				continue // explicit null overrides treated as empty
+			}
+			arrDelim, ok := arrTok.(json.Delim)
+			if !ok || arrDelim != '[' {
+				return nil, nil, errors.New("invalid config JSON: overrides must be an array")
+			}
+
+			processed := 0
+			capWarned := false
+			for dec.More() {
+				if processed >= maxConfigOverrides {
+					if !capWarned {
+						addWarn(fmt.Sprintf("config override cap (%d) reached; remaining entries ignored", maxConfigOverrides))
+						capWarned = true
+					}
+					if err := skipJSONValue(dec); err != nil {
+						return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
+					}
+					continue
+				}
+				var entry configOverrideEntry
+				if err := dec.Decode(&entry); err != nil {
+					return nil, nil, fmt.Errorf("invalid config override entry %d: %w", processed+1, err)
+				}
+				processed++
+
+				if !validateJobKeyComponent(entry.Source) || !validateJobKeyComponent(entry.ID) {
+					addWarn(fmt.Sprintf("config entry %d: invalid or missing source/id; skipped", processed))
+					continue
+				}
+
+				alias := trimToRunes(sanitizeText(entry.Alias), maxAliasRunes)
+				hasAlias := entry.HasAlias || alias != ""
+
+				color := ""
+				if strings.TrimSpace(entry.Color) != "" {
+					if norm, ok := normalizeHexColor(entry.Color); ok {
+						color = norm
+					} else {
+						addWarn(fmt.Sprintf("config entry %d (%s/%s): invalid hex color ignored", processed, sanitizeText(entry.Source), sanitizeText(entry.ID)))
+					}
+				}
+
+				if !hasAlias && color == "" {
+					continue
+				}
+
+				overrides[JobKey{Source: entry.Source, ID: entry.ID}] = JobOverride{
+					Alias:    alias,
+					HasAlias: hasAlias,
+					Color:    color,
+				}
+			}
+
+			// Consume closing ']'.
+			if _, err := dec.Token(); err != nil {
+				return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
+			}
+
+		default:
+			if err := skipJSONValue(dec); err != nil {
+				return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
 			}
 		}
+	}
 
-		if !hasAlias && color == "" {
-			continue
-		}
+	// Consume closing '}'.
+	if _, err := dec.Token(); err != nil {
+		return nil, nil, fmt.Errorf("invalid config JSON: %w", err)
+	}
+	// Reject trailing tokens after root JSON object.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, nil, errors.New("invalid config JSON: unexpected trailing data")
+	}
 
-		overrides[JobKey{Source: src, ID: id}] = JobOverride{
-			Alias:    alias,
-			HasAlias: hasAlias,
-			Color:    color,
-		}
+	if !hasVersion || versionVal != currentConfigVersion {
+		return nil, nil, fmt.Errorf("missing or unsupported config version %d (supported: %d)", versionVal, currentConfigVersion)
 	}
 
 	if suppressed > 0 {
@@ -267,18 +424,51 @@ func LoadConfig(path string) (map[JobKey]JobOverride, []string, error) {
 	return overrides, warnings, nil
 }
 
-// SaveConfig atomically serializes and writes sanitized job overrides to path.
+// skipJSONValue consumes a single JSON value from dec in O(depth) memory without
+// allocating objects/slices for ignored entries.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if delim != '{' && delim != '[' {
+		return fmt.Errorf("unexpected delimiter %q", delim)
+	}
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := t.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
+// SaveConfig atomically serializes and writes validated job overrides to path.
 func SaveConfig(path string, overrides map[JobKey]JobOverride) error {
 	cleanPath, err := validateConfigPath(path)
 	if err != nil {
 		return err
 	}
+	if len(overrides) > maxConfigOverrides {
+		return fmt.Errorf("override count %d exceeds maximum %d", len(overrides), maxConfigOverrides)
+	}
 
 	entries := make([]configOverrideEntry, 0, len(overrides))
 	for key, ov := range overrides {
-		src := sanitizeText(key.Source)
-		id := sanitizeText(key.ID)
-		if src == "" || id == "" {
+		if !validateJobKeyComponent(key.Source) || !validateJobKeyComponent(key.ID) {
 			continue
 		}
 		alias := trimToRunes(sanitizeText(ov.Alias), maxAliasRunes)
@@ -293,8 +483,8 @@ func SaveConfig(path string, overrides map[JobKey]JobOverride) error {
 			continue
 		}
 		entries = append(entries, configOverrideEntry{
-			Source:   src,
-			ID:       id,
+			Source:   key.Source,
+			ID:       key.ID,
 			Alias:    alias,
 			HasAlias: hasAlias,
 			Color:    color,
@@ -307,9 +497,6 @@ func SaveConfig(path string, overrides map[JobKey]JobOverride) error {
 		}
 		return entries[i].ID < entries[j].ID
 	})
-	if len(entries) > maxConfigOverrides {
-		entries = entries[:maxConfigOverrides]
-	}
 
 	payload := configFileData{
 		Version:   currentConfigVersion,

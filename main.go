@@ -109,11 +109,11 @@ func loadProvidersCmd(ctx context.Context, loader *ProviderLoader, gen uint64) t
 	}
 }
 
-func saveConfigCmd(store *ConfigStore, gen uint64, overrides map[JobKey]JobOverride) tea.Cmd {
+func saveConfigCmd(store *ConfigStore, gen uint64) tea.Cmd {
 	return func() tea.Msg {
 		return configSavedMsg{
 			gen: gen,
-			err: store.SaveSerialized(gen, overrides),
+			err: store.Flush(gen),
 		}
 	}
 }
@@ -382,6 +382,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.settingsNotice = ""
 		} else {
 			m.configErr = ""
+			m.configWarnings = nil
 			m.settingsError = ""
 			if m.state == viewSettings {
 				m.settingsNotice = "Saved settings"
@@ -555,8 +556,9 @@ func (m model) handleSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Blur()
 			if m.configStore != nil && !m.configLoadFailed {
 				m.saveGen++
+				m.configStore.Enqueue(m.saveGen, m.overrides)
 				m.settingsNotice = "Saving settings..."
-				return m, saveConfigCmd(m.configStore, m.saveGen, cloneOverrides(m.overrides))
+				return m, saveConfigCmd(m.configStore, m.saveGen)
 			}
 			if m.configStore != nil && m.configLoadFailed {
 				m.settingsNotice = "Updated in-memory only (fix config error first)"
@@ -831,7 +833,7 @@ func (m model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, body, m.renderFooter())
 }
 
-func main() {
+func run() int {
 	demo := flag.Bool("demo", false, "Populate UI with sample scheduled jobs")
 	crontabPath := flag.String("crontab", "", "Read user-format crontab file path (5 fields, read-only; not /etc/crontab)")
 	configPath := flag.String("config", "", "Path to config JSON file (default: $XDG_CONFIG_HOME/crolendar/config.json)")
@@ -840,7 +842,7 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("crolendar %s\n", version)
-		return
+		return 0
 	}
 
 	appCtx, cancel := context.WithCancel(context.Background())
@@ -855,12 +857,13 @@ func main() {
 	}
 
 	explicitConfig := strings.TrimSpace(*configPath) != ""
+	var configStore *ConfigStore
 	if !*demo || explicitConfig {
 		resolvedPath, err := ResolveConfigPath(*configPath)
 		if err != nil {
 			if explicitConfig {
 				fmt.Fprintf(os.Stderr, "crolendar config error: %v\n", err)
-				os.Exit(1)
+				return 1
 			}
 			m.configLoadFailed = true
 			m.configErr = sanitizeText(err.Error())
@@ -869,20 +872,36 @@ func main() {
 			if err != nil {
 				if explicitConfig {
 					fmt.Fprintf(os.Stderr, "crolendar config error: %v\n", err)
-					os.Exit(1)
+					return 1
 				}
 				m.configLoadFailed = true
 				m.configErr = sanitizeText(err.Error())
 			} else {
-				defer store.Wait()
+				configStore = store
 				m.attachConfigStore(store)
+				if explicitConfig && m.configLoadFailed {
+					fmt.Fprintf(os.Stderr, "crolendar config error: %s\n", m.configErr)
+					return 1
+				}
 			}
 		}
 	}
+	defer func() {
+		if configStore != nil {
+			if err := configStore.CloseAndFlush(); err != nil {
+				fmt.Fprintf(os.Stderr, "crolendar config save error: %v\n", err)
+			}
+		}
+	}()
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "crolendar error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func main() {
+	os.Exit(run())
 }
